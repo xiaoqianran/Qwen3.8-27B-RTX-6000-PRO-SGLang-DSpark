@@ -1,0 +1,4 @@
+# Runtime artifacts
+.cache/
+.sglang.log
+.sglang.pid
