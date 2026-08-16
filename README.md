@@ -21,7 +21,7 @@ The serving recipe builds on the **[SGLang cookbook's RTX PRO 6000 cell](https:/
 
 | Component | Detail |
 |---|---|
-| Hardware | NVIDIA RTX PRO 6000 (96 GB, SM120/Blackwell; *not* for 32 GB — see the 5090 fork) |
+| Hardware | NVIDIA RTX PRO 6000 (96 GB, SM120/Blackwell; this recipe needs the 96 GB budget) |
 | Docker | With NVIDIA Container Toolkit / GPU passthrough working (`docker run --gpus all`) |
 | SGLang image | `lmsysorg/sglang:qwen38-27b` (model-specific build from the cookbook; multi-arch incl. amd64) |
 | CLI tools | `docker`, `curl` |
@@ -88,7 +88,7 @@ Defaults live at the top of `start.sh`:
 
 ### Notable serving choices
 
-- **DSpark speculative decoding (default, not MTP):** `--speculative-algorithm DSPARK --speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark --speculative-dspark-block-size 7 --speculative-draft-model-quantization unquant --speculative-draft-attention-backend flashinfer`. Block 7 = 8 draft tokens/step (verify width 8 incl. the bonus token). The draft runs unquantized (BF16) per the drafter card — quantizing it to the target's NVFP4 did not raise acceptance while costing decode speed. **Why not MTP:** measured head-to-head, DSpark drafts faster (higher acceptance, cheaper steps), and the in-checkpoint MTP head's bf16 module eats ~3 GB that on a 32 GB card collapses the KV pool — on the 5090 fork that made MTP slower end-to-end. With a 96 GB budget, DSpark is the strict speed win with no trade-off.
+- **DSpark speculative decoding (default, not MTP):** `--speculative-algorithm DSPARK --speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark --speculative-dspark-block-size 7 --speculative-draft-model-quantization unquant --speculative-draft-attention-backend flashinfer`. Block 7 = 8 draft tokens/step (verify width 8 incl. the bonus token). The draft runs unquantized (BF16) per the drafter card — quantizing it to the target's NVFP4 did not raise acceptance while costing decode speed. **Why not MTP:** measured head-to-head, DSpark drafts faster (higher acceptance, cheaper steps), and the in-checkpoint MTP head's bf16 module eats ~3 GB that on a 32 GB card collapses the KV pool. With a 96 GB budget, DSpark is the strict speed win with no trade-off.
 - **`--linear-attn-verify-backend triton`** — the GDN verify path for the draft; part of the validated DSpark recipe.
 - **`--min-free-slots-delay 1`** — scheduler admits requests promptly against the pinned mamba pool (keeps latency low at low concurrency).
 - **`--context-length 262144`** — the model's **native 256K** window (no YaRN / override env needed).
@@ -148,10 +148,6 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 ├── .gitignore    # excludes .cache/, logs, pid file
 └── README.md
 ```
-
-## Notes for the 5090 (32 GB) fork
-
-This recipe targets RTX PRO 6000 (96 GB) only: with a drafter active, a 32 GB card has ~2 GB of KV room (DSpark: ~8.6K-token pool; MTP: 4–6K), which is why the 5090 cookie-cutter runs **no speculative decoding** and a ~70K-token fp8 pool or the EAGLE demo at mem-fraction 0.98. If you only have 32 GB, use `SPEC=off ./start.sh` from that branch — don't run this 96 GB recipe there.
 
 ## Credits
 
