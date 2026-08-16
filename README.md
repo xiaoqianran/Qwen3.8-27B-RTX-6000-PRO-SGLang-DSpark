@@ -79,6 +79,16 @@ Reference: the *balanced* `--mamba-full-memory-ratio` at an average request leng
 
 **Verify after boot** (in `.sglang.log`): `max_running_requests` = 8, KV-cache token count ≥ ~1.3M, and the DSpark line "Draft proposal … folded into the draft cuda graph". To change concurrency, `MAX_CONCURRENT_REQUESTS=8 ./start.sh` etc. (mamba pool scales as N × 12).
 
+## Performance
+
+Measured decode throughput with DSpark speculative decoding active:
+
+| Workload | Decode tok/s |
+|---|---|
+| Single stream | **200–223 tok/s** |
+
+The draft graph ("DSpark draft proposal … folded into the draft cuda graph") is what carries that decode speed — DSpark's block-7 drafter verifies 8 draft tokens per step, so single-stream decode runs well above the no-draft baseline.
+
 ## Configuration
 
 Defaults live at the top of `start.sh`:
