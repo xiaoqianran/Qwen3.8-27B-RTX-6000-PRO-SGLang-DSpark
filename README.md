@@ -1,18 +1,18 @@
-# Qwen3.8 27B on SGLang for RTX 5090
+# Qwen3.8 27B on SGLang for RTX PRO 6000
 
 [![SGLang](https://img.shields.io/badge/SGLang-cookbook-blue)](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)
 [![Model](https://img.shields.io/badge/model-Qwen3.8--27B-informational)](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)
-[![arch](https://img.shields.io/badge/arch-SM120%20%2F%2032GB-lightgrey)](#)
+[![arch](https://img.shields.io/badge/arch-SM120%20%2F%2096GB-lightgrey)](#)
 
-Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA **RTX 5090 (32 GB, SM120)**. One script starts an OpenAI-compatible server, one stops it.
+Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA **RTX PRO 6000 (96 GB, SM120 / Blackwell)**. One script starts an OpenAI-compatible server, one stops it.
 
-The serving recipe is the **[SGLang cookbook's RTX 5090 cell](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)** — the model-specific, validated launch configuration — with the cookbook's speed options turned on and its GDN state-pool calculator worked out for 32 GB.
+The serving recipe builds on the **[SGLang cookbook's RTX PRO 6000 cell](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)** for the model, with the **DSpark** speculative-decoding recipe from the Qwen3.8-27B drafter card, and the GDN state-pool calculator worked out for 96 GB.
 
-- **NVFP4 W4A4** checkpoint — cookbook: "NVFP4 weights ~16.5 GB (recommended for RTX 5090-class GPUs)"; FP8 (~28.5 GB) is "not serviceable beyond bs≤2" on 32 GB cards and bf16 (~54 GB) does not fit at all
-- **100K-token context** — calculator-derived so a full-length request always fits the KV pool (1M YaRN is physically impossible here: one 1M request alone needs ~33 GB of KV)
-- **FP8 KV cache** (`fp8_e4m3`, ~2× KV memory savings, checkpoint calibration scales)
-- **MTP speculative decoding** (EAGLE 3/1/4 via the in-checkpoint MTP head) — faster decode
-- **2 concurrent requests** with the GDN state pool sized from the cookbook formula
+- **NVFP4 W4A4** checkpoint — cookbook: "NVFP4 weights ~16.5 GB (recommended);" bf16 (~54 GB) and FP8 (~28.5 GB) also fit on 96 GB but NVFP4 is the fastest/smallest
+- **Full 256K-token context** — the model's native 262,144 window, no YaRN needed; the ~1.5M-token fp8 KV pool covers it with room to spare
+- **FP8 KV cache** (`fp8_e4m3`, ~32.8 KB/token, checkpoint calibration scales) — SGLang's 4-bit KV paths are not built for this hybrid-GDN model in this image, so FP8 is the best supported precision
+- **DSpark speculative decoding** (trained BF16 drafter `RadixArk/Qwen3.8-27B-DSpark`, block 7 = 8 draft tokens/step) — ***not*** the in-checkpoint MTP head: measured head-to-head, DSpark wins on speed/acceptance while MTP's bf16 module wastes ~3 GB and squeezes the KV pool
+- **8 concurrent requests** with the GDN state pool sized from the cookbook formula
 - **Thinking mode on by default** (`--reasoning-parser qwen3` → `reasoning_content`) and **tool calling** (`qwen3_coder` parser)
 
 ---
@@ -21,13 +21,13 @@ The serving recipe is the **[SGLang cookbook's RTX 5090 cell](https://docs.sglan
 
 | Component | Detail |
 |---|---|
-| Hardware | NVIDIA RTX 5090 (32 GB, SM120/Blackwell) |
+| Hardware | NVIDIA RTX PRO 6000 (96 GB, SM120/Blackwell; *not* for 32 GB — see the 5090 fork) |
 | Docker | With NVIDIA Container Toolkit / GPU passthrough working (`docker run --gpus all`) |
 | SGLang image | `lmsysorg/sglang:qwen38-27b` (model-specific build from the cookbook; multi-arch incl. amd64) |
 | CLI tools | `docker`, `curl` |
 | Hugging Face token | `HF_TOKEN` defined in `~/.bashrc` (picked up automatically; higher rate limits) |
 
-There is no separate download step: the container pulls the checkpoint into `./.cache/huggingface` on first start (~22 GB download; the cookbook cites ~16.5 GB for the NVFP4 LM weights alone, before the vision tower + MTP head).
+There is no separate download step: the container pulls both checkpoints into `./.cache/huggingface` on first start (~22 GB base + ~2.7 GB DSpark drafter).
 
 ## Quick start
 
@@ -53,24 +53,24 @@ curl http://127.0.0.1:8888/v1/models
 
 Runtime artifacts: `.sglang.log` (server log), `.sglang.pid` (container ID), `.cache/` (HF + Triton caches). All are git-ignored.
 
-## The calculator (32 GB, done)
+## The calculator (96 GB, done)
 
-The cookbook's [mamba ratio calculator](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B#mamba-ratio-calculator) for this model, evaluated for the 5090:
+The cookbook's [mamba ratio calculator](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B#mamba-ratio-calculator) for this model, evaluated for the RTX PRO 6000:
 
 | Input | Value | Source |
 |---|---|---|
-| Static memory budget | 32 GB × `0.85` = **27.2 GB** | cookbook RTX 5090 cell |
-| Weights (NVFP4 + vision + MTP) | **~17–22 GB** | cookbook (LM figure) / repo blobs (full) |
+| Static memory budget | 96 GB × `0.90` = **~86 GB** | this recipe |
+| Weights (NVFP4 base + DSpark BF16 drafter) | **~24.5 GB** = 21.9 + 2.7 | repo blobs / drafter card |
 | State slot size | **78.4 MB** (48 GDN layers × 48 heads × 128 × 128 bf16 + conv) | cookbook |
-| Slots per request | S + D = **8** = 4 (`extra_buffer_lazy`) + 4 (MTP draft) | cookbook |
-| Concurrency | **2** → `--max-mamba-cache-size 16` → state pool **1.25 GB** | pinned |
+| Slots per request | S + D = **12** = 4 (`extra_buffer_lazy`) + 8 (DSpark block 7) | cookbook / drafter card |
+| Concurrency | **8** → `--max-mamba-cache-size 96` → state pool **7.5 GB** | pinned |
 | KV bytes/token (fp8) | **32.8 KB** (16 attn layers × GQA 4 × 256 × K+V) | cookbook |
-| KV pool left | **~4.0–9.5 GB** → **~120K–290K tokens** | arithmetic |
-| Context cap | **`--context-length 100000`** — a max request costs ~3.3 GB KV, fits even the worst-case pool | derived |
+| KV pool left | **~50 GB** → **~1.5M tokens** | arithmetic |
+| Context | **`--context-length 262144`** (full native 256K; no YaRN) | model config |
 
-Reference: the *balanced* `--mamba-full-memory-ratio` at an average request length of 32K tokens would be (8 × 78.4 MB) ÷ (32768 × 32.8 KB) ≈ **0.58**. This script pins the pool with `--max-mamba-cache-size` instead, which overrides the ratio. On 32 GB the state pool bounds concurrency long before KV does (cookbook tip), hence the lazy strategy (S=4) and the small pinned pool.
+Reference: the *balanced* `--mamba-full-memory-ratio` at an average request length of 32K tokens would be (12 × 78.4 MB) ÷ (32768 × 32.8 KB) ≈ **0.87**. This script pins the pool with `--max-mamba-cache-size`, which overrides the ratio. The ~1.5M-token pool means 8 concurrent requests can each run ~180K tokens, or share prefixes via the radix cache; a single request can use the full 262,144 at once.
 
-**Verify after boot** (in `.sglang.log`): `max_running_requests` ≥ 2, and the KV-cache token count ≥ ~120K. To change concurrency, adjust `--max-mamba-cache-size` in multiples of 8 (2 requests per 16 slots).
+**Verify after boot** (in `.sglang.log`): `max_running_requests` = 8, KV-cache token count ≥ ~1.3M, and the DSpark line "Draft proposal … folded into the draft cuda graph". To change concurrency, `MAX_CONCURRENT_REQUESTS=8 ./start.sh` etc. (mamba pool scales as N × 12).
 
 ## Configuration
 
@@ -78,47 +78,49 @@ Defaults live at the top of `start.sh`:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MODEL_ID` | `RadixArk/Qwen3.8-27B-NVFP4` | NVFP4 only — bf16 (~54 GB) doesn't fit; FP8 (~28.5 GB) "not serviceable beyond bs≤2" per cookbook |
-| `SERVED_MODEL_NAME` | `qwen3.8-27b-5090` | Name clients use in API requests |
+| `MODEL_ID` | `RadixArk/Qwen3.8-27B-NVFP4` | NVFP4 W4A4 (bf16/FP8 also fit on 96 GB — set `MODEL_ID` to `Qwen/Qwen3.8-27B` / `-FP8`, adjust expectations) |
+| `DRAFT_MODEL_ID` | `RadixArk/Qwen3.8-27B-DSpark` | Trained BF16 drafter (~2.7 GB, auto-downloads) |
+| `SERVED_MODEL_NAME` | `qwen3.8-27b-6000pro` | Name clients use in API requests |
 | `IMAGE` | `lmsysorg/sglang:qwen38-27b` | Cookbook-pinned image for this model |
-| `CONTAINER_NAME` | `qwen3.8-27b-sglang-5090` | Also used by `stop.sh` |
+| `CONTAINER_NAME` | `qwen3.8-27b-sglang-6000pro` | Also used by `stop.sh` |
 | `PORT` | `8888` | Listens on `0.0.0.0` via host networking |
-| Concurrency | 2 requests | `--max-mamba-cache-size 16` (see calculator) |
+| `MAX_CONCURRENT_REQUESTS` | `8` | Concurrency; mamba pool = N × 12 slots |
 
 ### Notable serving choices
 
-- **Recipe (cookbook, RTX 5090 cell):** `--mem-fraction-static 0.85`, `--attention-backend flashinfer` (`trtllm_mha` is SM100-only), `--chunked-prefill-size 2048`. The 2048-token chunks are deliberate: on hybrid GDN models, 8192-token chunks stall decode ~600 ms at a time; 2048 keeps inter-token latency smooth (8192 is the DGX Spark-only exception). No `--disable-prefill-cuda-graph` here — that flag is specific to the Spark cell.
-- **If the 5090 drives a display**, lower `--mem-fraction-static` to ~0.80 so the desktop keeps VRAM headroom.
-- **MTP speculative decoding:** `--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4` uses the checkpoint's own MTP head — the biggest decode-time win. MTP with FlashInfer needs a build newer than 0.6.15.post1 (the cookbook image is built for these recipes); if spec decode errors at boot, rerun with `--attention-backend triton`.
-- **Context:** `--context-length 100000` — native is 262,144 but the 32 GB KV pool (worst case ~120K tokens) can't service it; 100K guarantees a full-length request always schedules and two ~50–60K sessions run concurrently. The 1M YaRN extension from the model card is not applied: one 1M-token request needs ~33 GB of KV alone.
-- **KV cache:** explicit `--kv-cache-dtype fp8_e4m3`; the NVFP4 checkpoint declares FP8 KV anyway (`auto` would honor it with its calibration scales).
-- **Vision:** the model is a native VLM and SGLang serves the vision tower live (image + video input supported out of the box).
+- **DSpark speculative decoding (default, not MTP):** `--speculative-algorithm DSPARK --speculative-draft-model-path RadixArk/Qwen3.8-27B-DSpark --speculative-dspark-block-size 7 --speculative-draft-model-quantization unquant --speculative-draft-attention-backend flashinfer`. Block 7 = 8 draft tokens/step (verify width 8 incl. the bonus token). The draft runs unquantized (BF16) per the drafter card — quantizing it to the target's NVFP4 did not raise acceptance while costing decode speed. **Why not MTP:** measured head-to-head, DSpark drafts faster (higher acceptance, cheaper steps), and the in-checkpoint MTP head's bf16 module eats ~3 GB that on a 32 GB card collapses the KV pool — on the 5090 fork that made MTP slower end-to-end. With a 96 GB budget, DSpark is the strict speed win with no trade-off.
+- **`--linear-attn-verify-backend triton`** — the GDN verify path for the draft; part of the validated DSpark recipe.
+- **`--min-free-slots-delay 1`** — scheduler admits requests promptly against the pinned mamba pool (keeps latency low at low concurrency).
+- **`--context-length 262144`** — the model's **native 256K** window (no YaRN / override env needed).
+- **`--kv-cache-dtype fp8_e4m3`** — explicit; the NVFP4 checkpoint declares fp8 KV anyway (`auto` honors its calibration scales). SGLang's 4-bit KV options (`nvfp4`/`fp4_*`) are not wired for hybrid-GDN decode in this image (flashinfer rejects KV4 for it; the triton fp4 kernel doesn't exist), so fp8 is the best supported precision. At 32.8 KB/token the ~50 GB pool yields ~1.5M tokens.
+- **`--mem-fraction-static 0.90`** with `--chunked-prefill-size 4096` (smooth decode on hybrid GDN; 8192 is the DGX-Spark-only exception). No `--disable-prefill-cuda-graph` (that flag is Spark-specific).
+- **Vision:** the model is a native VLM; SGLang serves the vision tower live (image + video input out of the box).
 
 ## Thinking & tool calling
 
-- **Thinking mode is ON by default** — the chat template defaults `enable_thinking=true` and `preserve_thinking=true` (the full reasoning trace is retained across turns; good for agents and KV reuse). `--reasoning-parser qwen3` surfaces `<think>…</think>` as `reasoning_content` instead of inline text. Depth is tunable per request with `reasoning_effort=xhigh|medium|low` (xhigh default).
-- **Sampling defaults** come from the checkpoint's `generation_config.json` (`--sampling-defaults model`): thinking mode wants `temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0`.
-- **Tool calling** needs no extra SGLang flag (unlike vLLM's `--enable-auto-tool-choice`): `--tool-call-parser qwen3_coder` decodes the template's `<tool_call><function=…>/<parameter=…>` payload into structured `tool_calls`. Just send `tools` in the request. (The hermes parser expects a different payload and would never parse.)
+- **Thinking mode is ON by default** — the chat template defaults `enable_thinking=true` and `preserve_thinking=true` (full reasoning trace retained across turns; good for agents and KV reuse). `--reasoning-parser qwen3` surfaces ` thinking…/answer` as `reasoning_content`. Depth: `reasoning_effort=xhigh|medium|low` (xhigh default).
+- **Sampling defaults** come from the checkpoint (`--sampling-defaults model`): thinking wants `temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, presence_penalty=0.0`.
+- **Tool calling** needs no vLLM-style `--enable-auto-tool-choice`: `--tool-call-parser qwen3_coder` decodes the template's `<tool_call><function=…>/<parameter=…>` into structured `tool_calls`. Send `tools` in the request.
 
 ## Using the API
 
-OpenAI-compatible base URL: `http://127.0.0.1:8888/v1` (model name: `qwen3.8-27b-5090`).
+OpenAI-compatible base URL: `http://127.0.0.1:8888/v1` (model name: `qwen3.8-27b-6000pro`).
 
 ```bash
 curl http://127.0.0.1:8888/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.8-27b-5090",
-    "messages": [{"role": "user", "content": "Explain YaRN in two sentences."}]
+    "model": "qwen3.8-27b-6000pro",
+    "messages": [{"role": "user", "content": "Summarize a 100K-token log and tell me what failed."}]
   }'
 ```
 
-Non-thinking / instruct request (per the model card):
+Non-thinking / instruct request (per model card):
 
 ```json
 {
-  "model": "qwen3.8-27b-5090",
-  "messages": [{"role": "user", "content": "Write a haiku about GB202."}],
+  "model": "qwen3.8-27b-6000pro",
+  "messages": [{"role": "user", "content": "Write a haiku about GB203."}],
   "temperature": 0.7,
   "top_p": 0.8,
   "top_k": 20,
@@ -127,16 +129,15 @@ Non-thinking / instruct request (per the model card):
 }
 ```
 
-SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:8888/v1/messages` — for Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8888` (no `/v1` suffix; Claude Code appends it). The same parser flags apply there. Coding agents that speak plain OpenAI (OpenCode, Pi, …) point at `/v1` and use the served model name.
+SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:8888/v1/messages` — for Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8888` (no `/v1` suffix). Coding agents that speak plain OpenAI (OpenCode, Pi, …) point at `/v1` and use the served model name.
 
 ## Logs & troubleshooting
 
-- Tail the server log: `tail -f .sglang.log` (or `docker logs -f qwen3.8-27b-sglang-5090`)
-- `start.sh` prints the last 200 log lines and exits if the container dies before becoming ready
-- Concurrency check: `grep max_running_requests .sglang.log` — should be ≥ 2
-- If speculative decoding fails to start, switch `--attention-backend flashinfer` → `triton` (FlashInfer version caveat above)
-- If startup OOMs on a card that also runs a display, lower `--mem-fraction-static` to 0.80
-- First start downloads ~22 GB of weights; subsequent starts reuse `./.cache/huggingface`
+- Tail the server log: `tail -f .sglang.log` (or `docker logs -f qwen3.8-27b-sglang-6000pro`)
+- Start script prints the last 200 log lines and exits if the container dies before becoming ready
+- **Spec decode check:** `grep -i "DSpark draft proposal" .sglang.log` should show the draft proposal folded into the draft CUDA graph (draft works). `grep max_total_num_tokens .sglang.log` — expect ≥ ~1.3M
+- First start downloads ~22 GB base + ~2.7 GB drafter; subsequent starts reuse `./.cache/huggingface`
+- If the box also drives a display, lower `--mem-fraction-static` to ~0.85 so the desktop keeps VRAM headroom
 
 ## Repository layout
 
@@ -148,9 +149,14 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 └── README.md
 ```
 
+## Notes for the 5090 (32 GB) fork
+
+This recipe targets RTX PRO 6000 (96 GB) only: with a drafter active, a 32 GB card has ~2 GB of KV room (DSpark: ~8.6K-token pool; MTP: 4–6K), which is why the 5090 cookie-cutter runs **no speculative decoding** and a ~70K-token fp8 pool or the EAGLE demo at mem-fraction 0.98. If you only have 32 GB, use `SPEC=off ./start.sh` from that branch — don't run this 96 GB recipe there.
+
 ## Credits
 
-- [SGLang cookbook — Qwen3.8-27B](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B) — the RTX 5090 serving recipe, MTP guidance, and the GDN state-pool calculator
-- [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B) — sampling recommendations and thinking-mode behavior
-- [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4) — NVFP4 W4A4 checkpoint (FP8 KV calibration scales)
+- [SGLang cookbook — Qwen3.8-27B](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B) — serving recipe, DSpark/MTP guidance, GDN state-pool calculator
+- [RadixArk/Qwen3.8-27B-DSpark](https://huggingface.co/RadixArk/Qwen3.8-27B-DSpark) — trained DSpark drafter (~2.7 GB, BF16, block-7 serving recipe)
+- [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B) — 256K native context, sampling defaults, thinking-mode behavior
 - [SGLang](https://github.com/sgl-project/sglang) — inference engine and OpenAI/Anthropic-compatible server
+- [MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark) — the 128 GB sibling recipe (same DSpark block-7 path)

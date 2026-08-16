@@ -1,79 +1,81 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Qwen3.8-27B on SGLang (RTX 5090, 32GB VRAM, SM120)
+# Qwen3.8-27B on SGLang (RTX PRO 6000, 96GB VRAM, SM120/Blackwell)
 #
-# Recipe from the SGLang cookbook, RTX 5090 cell (verified recipe):
+# Recipe from the SGLang cookbook (RTX PRO 6000, nvfp4, balanced):
 #   https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B
+# and the DSpark serving recipe from the Qwen3.8-27B DSpark drafter card.
 #
-# Notes:
-#   - Dense hybrid GDN vision-language model (48 linear-attention + 16
-#     full-attention layers); SGLang serves it through the Qwen3-VL path,
-#     so the vision tower is live.
-#   - RTX 5090 cell specifics vs DGX Spark: --mem-fraction-static 0.85
-#     (not 0.95), --chunked-prefill-size 2048 (2048 keeps decode
-#     inter-token latency smooth on hybrid GDN models; 8192 is the
-#     DGX-Spark-only exception), and NO --disable-prefill-cuda-graph.
-#   - --attention-backend flashinfer is required on SM120
-#     (trtllm_mha is SM100-only).
-#   - NVFP4-only (cookbook: "NVFP4 weights ~16.5GB (recommended for
-#     RTX 5090-class GPUs)"; FP8 ~28.5GB is "not serviceable beyond
-#     bs<=2" on 32GB cards, bf16 ~54GB does not fit at all).
-#   - KV cache is explicitly FP8 (--kv-cache-dtype fp8_e4m3); the NVFP4
-#     checkpoint declares kv_cache_quant_algo: FP8, so its calibration
-#     scales are applied automatically. ~32.8 KB/token.
+# What this config is:
+#   - Full 256K context window (native 262,144 -- no YaRN needed; that is
+#     max_position_embeddings on the Qwen3.8-27B config).
+#   - DSpark speculative decoding (a separate ~2.7GB trained BF16 drafter:
+#     RadixArk/Qwen3.8-27B-DSpark). DSpark, NOT the in-checkpoint MTP head:
+#     measured head-to-head, DSpark drafts faster / higher acceptance while
+#     the MTP module (bf16, in-checkpoint) wastes ~3GB and its KV-pool
+#     squeeze makes it slower end-to-end on the 32GB card; on 96GB the
+#     choice is purely speed -> DSpark. DSpark = 8 draft tokens per step
+#     (block size 7 = verify width 8 incl. the bonus token).
+#   - 8 concurrent requests with the GDN state pool pinned from the
+#     cookbook calculator: S=4 (extra_buffer_lazy) + D=8 = 12 slots/req
+#     -> --max-mamba-cache-size 96 (see calculator below).
+#   - FlashInfer draft attention + the Triton linear-attention verify path
+#     (--linear-attn-verify-backend triton) per the DSpark recipe.
 #
-# Mamba/GDN state pool calculator (cookbook formula, done for 32GB):
-#   state slot  = 78.4 MB (48 GDN layers x 48 heads x 128 x 128 at bf16
-#                 + bf16 conv state)
-#   slots/req   = S + D = 4 (extra_buffer_lazy) + 4 (MTP draft) = 8
-#   state pool  = --max-mamba-cache-size 16 = 2 concurrent x 8 slots
-#               = 16 x 78.4 MB = ~1.25 GB
-#   budget      = 32 GB x 0.85 (mem-fraction-static) = 27.2 GB
-#   weights     = ~17 GB (cookbook LM figure) to ~22 GB (full repo incl.
-#                 vision tower + MTP head)
-#   KV pool     = 27.2 - weights - 1.25 = ~4.0-9.5 GB
-#               = ~120K-290K tokens at 32.8 KB/token (fp8)
-#   -> context  : --context-length 100000 (a max-length request costs
-#                 ~3.3 GB of KV and fits even the worst-case pool;
-#                 2 x ~50-60K sessions run concurrently)
-#   Reference: the balanced --mamba-full-memory-ratio at L=32K would be
-#   (8 x 78.4 MB) / (32768 x 32.8 KB) ~= 0.58; we pin the pool with
-#   --max-mamba-cache-size instead, which overrides the ratio.
-#   On 32GB the state pool bounds concurrency long before KV does
-#   (cookbook tip), hence lazy strategy (S=4) + a small pool.
-#   After boot, check in .sglang.log: max_running_requests >= 2 and the
-#   KV-cache token count >= ~120K.
+# Hardware notes:
+#   - --attention-backend flashinfer required on SM120 (trtllm_mha SM100-only).
+#   - NVFP4 W4A4 checkpoint (~16.5GB LM / ~21.9GB repo incl. vision + MTP
+#     head); FP8 (~28.5GB) fits fine on 96GB too but is slower + heavier.
+#   - KV cache is FP8 (--kv-cache-dtype fp8_e4m3). SGLang's 4-bit KV paths
+#     are not built for this hybrid-GDN model (flashinfer rejects KV4 for
+#     it, and the triton fp4 decode kernel does not exist in this image),
+#     so FP8 is the best supported precision here: 32.8 KB/token.
 #
-# Speed: MTP speculative decoding is ON (in-checkpoint MTP head):
-#   --speculative-algorithm EAGLE --speculative-num-steps 3 \
-#   --speculative-eagle-topk 1 --speculative-num-draft-tokens 4
-#   MTP with FlashInfer needs a FlashInfer build newer than 0.6.15.post1
-#   (prefill plan with uniform_q_len). The lmsysorg/sglang:qwen38-27b
-#   image is built for these recipes; if spec decode errors at boot,
-#   rerun with --attention-backend triton.
+# GDN state pool calculator (done for 96GB):
+#   state slot  = 78.4 MB (48 GDN layers x 48 heads x 128 x 128 bf16
+#                 + bf16 conv state), pinned with --mamba-ssm-dtype bfloat16.
+#   slots/req   = S + D = 4 (extra_buffer_lazy) + 8 (DSpark block 7) = 12
+#   state pool  = 8 concurrent x 12 slots = --max-mamba-cache-size 96
+#               = 96 x 78.4 MB = ~7.5 GB
+#   budget      = 96 GB x 0.90 (mem-fraction-static) = ~86 GB
+#   weights     = ~24.5 GB (21.9 base + 2.7 DSpark BF16 draft)
+#   graphs/runtime ~3-4 GB (flashinfer workspace, CUDA graphs, mm pools)
+#   KV pool     = 86 - 24.5 - 7.5 - 3.5 = ~50 GB -> ~1.5M tokens at 32.8KB
+#   -> context  : --context-length 262144 (full native 256K window). The
+#                 ~1.5M-token pool means 8 concurrent requests can each be
+#                 ~180K, or share prefixes via radix cache; a single
+#                 request can go the entire 262144 by itself.
+#   The balanced --mamba-full-memory-ratio at L=32K would be
+#   (12 x 78.4 MB) / (32768 x 32.8 KB) ~= 0.87; the pinned
+#   --max-mamba-cache-size overrides it. On 96GB, KV no longer bounds
+#   concurrency before the state pool does -> pin the pool explicitly.
+#   After boot, check .sglang.log: max_running_requests = 8, and the KV
+#   Cache #tokens (expect ~1.3-1.5M).
+#
+# Verify the DSpark path after boot (grep .sglang.log):
+#   "DSpark draft proposal (greedy + sampling) folded into the draft cuda
+#    graph." -> draft decode/verify graphs captured -> spec decode ON.
+#   max_total_num_tokens ~= 1300000+ -> the KV budget.
 #
 # Thinking & tool calling (model card + cookbook section 3):
 #   - Thinking mode is ON by default: the chat template defaults
 #     enable_thinking=true and preserve_thinking=true. --reasoning-parser
-#     qwen3 surfaces <think> as reasoning_content. Disable per request:
+#     qwen3 surfaces thinking as reasoning_content. Disable per request:
 #     chat_template_kwargs {"enable_thinking": false} (then prefer
-#     temperature=0.7, top_p=0.8, presence_penalty=1.5). Reasoning depth:
-#     reasoning_effort=xhigh|medium|low (xhigh default).
+#     temperature=0.7, top_p=0.8, presence_penalty=1.5).
 #   - --sampling-defaults model: recommended params from the checkpoint's
 #     generation_config.json (thinking: temperature=1.0, top_p=0.95,
 #     top_k=20, min_p=0.0, presence_penalty=0.0).
 #   - Tool calling: --tool-call-parser qwen3_coder decodes the template's
 #     <tool_call><function=...>/<parameter=...> payload; SGLang needs no
 #     vLLM-style --enable-auto-tool-choice.
-#
-# If the 5090 also drives a display, lower --mem-fraction-static to
-# ~0.80 so the desktop keeps VRAM headroom.
 
 MODEL_ID="RadixArk/Qwen3.8-27B-NVFP4"
-SERVED_MODEL_NAME="qwen3.8-27b-5090"
+DRAFT_MODEL_ID="RadixArk/Qwen3.8-27B-DSpark"
+SERVED_MODEL_NAME="qwen3.8-27b-6000pro"
 IMAGE="lmsysorg/sglang:qwen38-27b"
-CONTAINER_NAME="qwen3.8-27b-sglang-5090"
+CONTAINER_NAME="qwen3.8-27b-sglang-6000pro"
 HOST="0.0.0.0"
 PORT="8888"
 PID_FILE=".sglang.pid"
@@ -82,6 +84,15 @@ WORK_DIR="$(pwd)"
 HF_HOME="${WORK_DIR}/.cache/huggingface"
 TRITON_CACHE_DIR="${WORK_DIR}/.cache/triton"
 READY_URL="http://127.0.0.1:${PORT}/v1/models"
+
+# Concurrency knob: max concurrent requests. Each request holds 12 GDN
+# state slots (S=4 lazy + D=8 DSpark drafts) -> mamba cache = N x 12.
+MAX_CONCURRENT_REQUESTS="${MAX_CONCURRENT_REQUESTS:-8}"
+MAMBA_SLOTS_PER_REQ=12
+if (( MAX_CONCURRENT_REQUESTS > 8 )); then
+  echo "warning: MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS} -> mamba pool ${MAMBA_SLOTS_PER_REQ}xN slots"
+fi
+MAMBA_CACHE_SIZE=$(( MAX_CONCURRENT_REQUESTS * MAMBA_SLOTS_PER_REQ ))
 
 command -v docker >/dev/null 2>&1 || {
   echo "docker is not on PATH"
@@ -111,14 +122,16 @@ if docker ps -a --format '{{.Names}}' | grep -qx "${CONTAINER_NAME}"; then
   docker rm "${CONTAINER_NAME}" >/dev/null
 fi
 
-echo "Starting SGLang container for ${MODEL_ID} (RTX 5090, 32GB)"
+echo "Starting SGLang container for ${MODEL_ID} (RTX PRO 6000, 96GB)"
 echo "Image: ${IMAGE}"
+echo "Draft model: ${DRAFT_MODEL_ID} (DSpark, BF16, auto-downloads into HF cache)"
 echo "Served model name: ${SERVED_MODEL_NAME}"
+echo "Context: 262144 (native 256K), concurrency: ${MAX_CONCURRENT_REQUESTS}"
 echo "Listening on ${HOST}:${PORT}"
 echo "Writing progress to ${LOG_FILE}"
 
 cat >"${LOG_FILE}" <<EOF
-[$(date -Is)] launching SGLang container (RTX 5090)
+[$(date -Is)] launching SGLang container (RTX PRO 6000)
 EOF
 
 docker run -d \
@@ -138,17 +151,24 @@ docker run -d \
   --model-path "${MODEL_ID}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --trust-remote-code \
-  --mem-fraction-static 0.85 \
+  --mem-fraction-static 0.90 \
   --attention-backend flashinfer \
-  --chunked-prefill-size 2048 \
+  --chunked-prefill-size 4096 \
+  --max-prefill-tokens 4096 \
   --kv-cache-dtype fp8_e4m3 \
-  --context-length 100000 \
+  --mamba-ssm-dtype bfloat16 \
+  --mamba-full-memory-ratio 4.21 \
+  --context-length 262144 \
   --mamba-radix-cache-strategy extra_buffer_lazy \
-  --max-mamba-cache-size 16 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
+  --max-mamba-cache-size "${MAMBA_CACHE_SIZE}" \
+  --max-running-requests "${MAX_CONCURRENT_REQUESTS}" \
+  --linear-attn-verify-backend triton \
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path "${DRAFT_MODEL_ID}" \
+  --speculative-dspark-block-size 7 \
+  --speculative-draft-model-quantization unquant \
+  --speculative-draft-attention-backend flashinfer \
+  --min-free-slots-delay 1 \
   --reasoning-parser qwen3 \
   --tool-call-parser qwen3_coder \
   --sampling-defaults model \
@@ -193,6 +213,7 @@ echo "SGLang is ready"
 echo "OpenAI base URL: http://${HOST}:${PORT}/v1"
 echo "Anthropic-compatible: http://${HOST}:${PORT}/v1/messages (no /v1 suffix in ANTHROPIC_BASE_URL)"
 echo "Served model name: ${SERVED_MODEL_NAME}"
+echo "Context 256K, DSpark spec-decode ON, ${MAX_CONCURRENT_REQUESTS} concurrent"
 echo "Thinking: ON by default (disable per request: chat_template_kwargs {\"enable_thinking\": false})"
 
 echo "SGLang is ready and responding; shell is now free."
