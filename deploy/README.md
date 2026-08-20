@@ -1,7 +1,9 @@
 # Modal deployment
 
-`deploy/` is an independent Modal-native backend. It does not execute or import
-`start.sh`, `stop.sh`, or `patch/`.
+`deploy/` is the Modal-native lifecycle for this repository. It does not execute
+`start.sh` or `stop.sh`, but intentionally reuses the repository's existing
+`patch/sglang` DFlash2 compatibility layer so the Docker and Modal backends run
+the same SGLang recipe instead of maintaining duplicate patch code.
 
 ## Architecture
 
@@ -14,6 +16,11 @@ CPU preparation image (8 CPU, no GPU)
         ▼
 qwen38-27b-model-store (persistent Modal Volume)
         │ read-only
+        ▼
+lmsysorg/sglang:qwen38-27b
+        +
+shared patch/sglang DFlash2 backport
+        │
         ▼
 1 × RTX PRO 6000 maximum
         │
@@ -31,25 +38,40 @@ TRANSFORMERS_OFFLINE=1
 ```
 
 CPU preparation resolves each Hugging Face revision, downloads all shards, and
-writes a manifest. Before the temporary benchmark requests a GPU, a CPU
-readiness function verifies the configured repositories and every safetensors
-shard referenced by an index. GPU startup validates the same store again before
-launching SGLang.
+writes a manifest. Before GPU allocation, readiness checks verify the configured
+repositories and every safetensors shard referenced by an index.
 
 A separate `qwen38-27b-compile-cache` Volume persists Triton, TorchInductor,
 and SGLang compilation artifacts.
 
+## Why the shared patch is still required
+
+DFlash2 landed upstream after the `qwen38-27b` image was built. The currently
+available moving `dev-cu13` image can also lag the GitHub main branch, so checking
+main source is not sufficient to prove the registry image contains DFlash2.
+
+Modal therefore bakes the existing `patch/sglang` tree into the SGLang image at
+build time and immediately verifies:
+
+```python
+from sglang.srt.models.dflash import DFlash2DraftModel
+```
+
+If a future official image contains DFlash2, this compatibility layer can be
+removed once that exact image has been tested.
+
 ## One-time Modal workspace setup
 
 Use Image Builder `2025.06`; older builders can inject legacy Modal runtime
-dependencies into the SGLang Python environment.
+dependencies into third-party Python images.
 
 ```bash
 uv run modal workspace settings set image-builder-version 2025.06
 uv run modal workspace settings list
 ```
 
-The root project pins `modal[api-proxy-support]==1.5.3` for local proxy support.
+The code also restores `typing_extensions==4.16.0` as a compatibility guard for
+legacy builders.
 
 ## Temporary benchmark
 
@@ -57,10 +79,19 @@ The root project pins `modal[api-proxy-support]==1.5.3` for local proxy support.
 uv run modal run deploy/modal_app.py --max-tokens 2048
 ```
 
-The order is CPU preparation/readiness → first HTTP health request → one RTX PRO
-6000 cold start → three warmups → single-stream benchmark. Modal Servers return
-503 while scaling from zero; the local benchmark retries health checks until the
-server is ready.
+Order:
+
+```text
+CPU model preparation/readiness
+→ first public health request
+→ one RTX PRO 6000 cold start
+→ SGLang load
+→ three warmups
+→ single-stream benchmark
+```
+
+The local benchmark retries expected 502/503/504 responses during zero-to-one
+cold start.
 
 ## Persistent endpoint
 
@@ -68,24 +99,24 @@ server is ready.
 uv run modal deploy deploy/modal_app.py
 ```
 
-The deployed server has:
+Runtime limits:
 
 ```text
 min_containers              0
 max_containers              1
-Modal target_concurrency    unset (no horizontal autoscaling target)
+Modal target_concurrency    unset
 SGLang max running requests 8
 ```
 
-Concurrency belongs to SGLang, not the Modal autoscaler. All 1–8 active requests
-are handled by the same SGLang process on the same RTX PRO 6000. The hard
-`max_containers=1` cap prevents a second GPU container from being started; this
-also means rolling redeploys cannot use a temporary spare replica.
+All 1–8 active requests are handled by one SGLang process on one RTX PRO 6000.
+Modal is never allowed to start a second GPU container.
 
 ## Default inference profile
 
 ```text
 GPU                       RTX-PRO-6000
+SGLang image              lmsysorg/sglang:qwen38-27b
+DFlash2 compatibility     patch/sglang
 Target                    RadixArk/Qwen3.8-27B-NVFP4
 Draft                     z-lab/Qwen3.8-27B-DFlash2
 DFlash2 draft tokens      8
@@ -97,23 +128,6 @@ SGLang running requests   8
 Modal max containers      1
 ```
 
-Serving settings live only in `modal_config.py`.
-
-For reproducibility, exact model revisions and a known-good SGLang image can be
-pinned without changing source:
-
-```powershell
-$env:QWEN38_MODEL_REVISION="<commit>"
-$env:QWEN38_DRAFT_MODEL_REVISION="<commit>"
-$env:QWEN38_SGLANG_IMAGE="lmsysorg/sglang:<known-good-tag-or-digest>"
-uv run modal deploy deploy/modal_app.py
-```
-
-The endpoint is currently `unauthenticated=True`, which is convenient for direct
-OpenAI-compatible clients but makes possession of the URL sufficient to trigger
-the single paid GPU. Add Modal Proxy authentication before treating this as a
-public production endpoint.
-
-Upstream serving improvements should be deliberately ported into
-`modal_config.py`; the Modal backend never sources runtime configuration from
-`start.sh`.
+Serving values live in `modal_config.py`. The endpoint is currently
+`unauthenticated=True`; add authentication before exposing a paid production
+endpoint publicly.
