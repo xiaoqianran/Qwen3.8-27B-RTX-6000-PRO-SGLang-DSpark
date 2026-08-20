@@ -94,9 +94,10 @@ owned by SGLang instead of being frozen in this deployment.
 
 ## Lifecycle
 
-SGLang runs as a subprocess in its own process session. Modal is configured to
-route up to eight concurrent HTTP requests into the single GPU replica, while
-`max_containers=1` guarantees that autoscaling cannot allocate a second GPU.
+SGLang runs as a subprocess in its own process session. Modal's autoscaling
+target is aligned with SGLang at eight concurrent requests; it is not a hard
+request cap. `max_containers=1` guarantees that demand can never allocate a
+second GPU, and excess work can queue instead.
 
 `exit_grace_period=300` gives an in-flight long generation time to finish when a
 Server is being removed. The `@modal.exit` handler then gives SGLang 20 seconds
@@ -139,7 +140,7 @@ min_containers       0
 max_containers       1
 target_concurrency   8
 GPU replicas         0 or 1
-SGLang requests      up to 8 inside that one GPU
+SGLang requests      up to 8 active inside that one GPU
 ```
 
 The local benchmark retries expected 502/503/504 responses while the Modal
