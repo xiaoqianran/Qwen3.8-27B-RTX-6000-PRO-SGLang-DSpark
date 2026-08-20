@@ -13,7 +13,7 @@ import urllib.request
 
 import modal
 
-from deploy.modal_benchmark import run_single_stream_benchmark
+from deploy.modal_benchmark import run_concurrency_benchmark
 from deploy.modal_config import (
     COMPILE_CACHE_PATH,
     CONFIG,
@@ -194,6 +194,27 @@ def _warmup() -> None:
         print(f"warmup {i + 1}/3: {tokens} tokens", flush=True)
 
 
+def _parse_concurrency_levels(spec: str) -> list[int]:
+    levels: list[int] = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            level = int(item)
+        except ValueError as exc:
+            raise ValueError(f"invalid concurrency value: {item!r}") from exc
+        if not 1 <= level <= CONFIG.max_running_requests:
+            raise ValueError(
+                f"concurrency must be between 1 and {CONFIG.max_running_requests}"
+            )
+        if level not in levels:
+            levels.append(level)
+    if not levels:
+        raise ValueError("--concurrency must contain at least one integer")
+    return levels
+
+
 @app.server(
     image=sglang_image,
     gpu=CONFIG.gpu,
@@ -229,6 +250,8 @@ class Qwen38Server:
         )
         _wait_ready(self.process)
         _warmup()
+        compile_cache.commit()
+        print("Compile cache committed.", flush=True)
 
     @modal.exit()
     def shutdown(self):
@@ -248,19 +271,24 @@ class Qwen38Server:
 
 
 @app.local_entrypoint()
-async def main(max_tokens: int = 1024):
+async def main(max_tokens: int = 1024, concurrency: str = "1"):
     if max_tokens < 128:
         raise ValueError("--max-tokens must be >= 128")
+    levels = _parse_concurrency_levels(concurrency)
 
     # CPU preparation finishes before the first request can allocate the single
     # RTX PRO 6000 container.
     await model_store_ready.remote.aio()
     url = await Qwen38Server.get_url.aio()
     await asyncio.to_thread(_wait_for_public_server, url)
-    await asyncio.to_thread(
-        run_single_stream_benchmark,
-        url,
-        CONFIG.served_model_name,
-        max_tokens,
-    )
+
+    for level in levels:
+        await asyncio.to_thread(
+            run_concurrency_benchmark,
+            url,
+            CONFIG.served_model_name,
+            max_tokens,
+            level,
+        )
+
     print("Benchmark complete; the temporary `modal run` Server will now stop.")
