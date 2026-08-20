@@ -1,246 +1,119 @@
 # Modal deployment
 
-This directory is an **independent Modal deployment layer** for this fork.
+`deploy/` is an independent Modal-native backend. It does not execute or import
+`start.sh`, `stop.sh`, or `patch/`.
 
-It intentionally does **not** import, execute, copy, or patch the repository's
-existing `start.sh`, `stop.sh`, `patch/`, or Docker workflow. Upstream changes
-to those files can therefore be merged independently of the Modal deployment.
+## Structure
+
+```text
+deploy/
+├── modal_config.py     # serving/storage settings
+├── model_prepare.py    # CPU-only Hugging Face download + validation
+├── modal_app.py        # Modal orchestration + SGLang GPU server
+└── modal_benchmark.py  # single-stream decode benchmark
+```
 
 ## Architecture
 
 ```text
-deploy/
-├── modal_app.py        # CPU model preparation + Modal lifecycle + SGLang Server
-├── modal_config.py     # serving/storage/download knobs in one place
-├── modal_benchmark.py  # local streaming decode benchmark
-└── README.md
+CPU preparation image (8 CPU, no GPU)
+        │
+        ├── Qwen3.8-27B-NVFP4
+        └── Qwen3.8-27B-DFlash2
+        │
+        ▼
+qwen38-27b-model-store (persistent Modal Volume)
+        │ read-only
+        ▼
+RTX PRO 6000
+        │
+        └── SGLang + DFlash2 + FlashInfer
 ```
 
-Runtime dependency chain:
-
-```text
-uv -> Modal -> official SGLang image -> persistent Modal model Volume
-                                         ├── Qwen3.8-27B NVFP4
-                                         └── DFlash2
-```
-
-The default profile is optimized for **single-user decode**:
-
-- GPU: `RTX-PRO-6000`
-- target: `RadixArk/Qwen3.8-27B-NVFP4`
-- draft: `z-lab/Qwen3.8-27B-DFlash2`
-- DFlash2 draft tokens: `8`
-- target/draft attention backend: `flashinfer`
-- KV cache: `fp8_e4m3`
-- static memory fraction: `0.90`
-- native context: `262144`
-- SGLang max running requests: `1`
-- Modal target concurrency: `1`
-
-All deployment settings live in `modal_config.py`.
-
-## Important: CPU downloads, GPU only loads/serves
-
-Model download is intentionally separated from GPU execution.
-
-On the first build, Modal executes an `Image.run_function(...)` build step with:
-
-```text
-GPU: none
-CPU: 8 cores
-Hugging Face download workers: 16
-```
-
-That CPU-only step materializes both complete Hugging Face snapshots into the
-persistent Volume:
-
-```text
-qwen38-27b-model-store
-└── /models
-    ├── target/   # RadixArk/Qwen3.8-27B-NVFP4
-    └── draft/    # z-lab/Qwen3.8-27B-DFlash2
-```
-
-Only after the image/model preparation succeeds can Modal start the RTX PRO
-6000 server.
-
-The GPU server launches SGLang with **local paths**:
+The GPU server uses only local paths:
 
 ```text
 --model-path /models/target
 --speculative-draft-model-path /models/draft
-```
-
-and explicitly sets:
-
-```text
 HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
 ```
 
-Therefore the GPU container cannot silently fall back to downloading the model
-from Hugging Face. If the model Volume is incomplete, startup fails instead.
+If the model Volume is incomplete, GPU startup fails instead of downloading.
+GPU-side model storage is mounted read-only.
 
-This means the expensive RTX PRO 6000 is used for:
+A separate `qwen38-27b-compile-cache` Volume persists Triton, TorchInductor,
+and SGLang compilation artifacts.
 
-1. reading already-persisted weights from the Modal Volume,
-2. loading weights into GPU memory,
-3. CUDA/SGLang initialization and graph/kernel preparation,
-4. warmup and inference.
+## Required Modal image builder
 
-Network download/hashing of model shards happens before GPU allocation.
+Use Modal Image Builder `2025.06`. Older builders can inject legacy Modal
+runtime dependencies into the SGLang image and break its Python environment.
 
-## Persistent compile cache
-
-A second Volume is used for GPU-specific compilation artifacts:
-
-```text
-qwen38-27b-compile-cache
+```bash
+uv run modal workspace settings set image-builder-version 2025.06
 ```
 
-It stores:
+This only needs to be configured once per workspace.
 
-```text
-/compile-cache/triton
-/compile-cache/torchinductor
-/compile-cache/sglang
-```
+## Local client
 
-Some CUDA/kernel preparation necessarily requires the actual GPU on the first
-cold start, but later containers can reuse these caches instead of rebuilding
-everything.
-
-## Local Modal client with API proxy support
-
-The root `pyproject.toml` depends on:
+The root project uses:
 
 ```text
 modal[api-proxy-support]==1.5.3
 ```
 
-Equivalent manual install:
+so local Modal API traffic can use proxy support while the remote SGLang image
+remains independent.
+
+## Temporary benchmark
 
 ```bash
-uv pip install 'modal[api-proxy-support]'
-```
-
-Use `uv run` so the proxy-enabled Modal client is always selected.
-
-## Run a temporary benchmark
-
-From the repository root:
-
-```bash
-uv run modal setup
 uv run modal run deploy/modal_app.py --max-tokens 2048
 ```
 
-The first ever invocation may spend time in the **CPU image-build/model-download
-stage**, but it does not allocate the RTX PRO 6000 for that download.
+Before requesting the RTX PRO 6000, the local entrypoint waits for the CPU model
+preparation/readiness function. The benchmark then starts one GPU server, warms
+it three times, measures one decode stream, prints `DECODE TOK/S`, and exits.
 
-After the model Volume exists, later runs reuse it.
-
-`modal run` then starts a temporary GPU server, performs three warmup requests,
-runs one streaming benchmark, prints `DECODE TOK/S`, and exits.
-
-## Deploy a persistent endpoint
+## Persistent endpoint
 
 ```bash
 uv run modal deploy deploy/modal_app.py
 ```
 
-Image build/model preparation still happens before the GPU server is eligible
-to start, so `modal deploy` does not require a separate manual download command.
+Deploy builds the small CPU preparation image and the SGLang runtime image as
+separate build graphs. Model weights remain in the Volume across deployments.
+The RTX PRO 6000 is allocated only when the deployed server receives traffic.
 
-The deployed server is OpenAI-compatible:
-
-```text
-POST <modal-url>/v1/chat/completions
-```
-
-Model name:
+## Default inference profile
 
 ```text
-qwen3.8-27b
+GPU                       RTX-PRO-6000
+Target                    RadixArk/Qwen3.8-27B-NVFP4
+Draft                     z-lab/Qwen3.8-27B-DFlash2
+DFlash2 draft tokens      8
+Attention                 flashinfer
+KV cache                  fp8_e4m3
+Context                   262144
+mem-fraction-static       0.90
+SGLang running requests   1
+Modal target concurrency  1
 ```
 
-The current server is `unauthenticated=True`; add application/proxy
-authentication before exposing a paid production endpoint.
+Change serving values only in `modal_config.py`.
 
-## Model revisions
-
-By default the model repositories use their current default revisions.
-
-For reproducible deployment, pin exact Hugging Face revisions locally:
-
-PowerShell:
+For reproducibility, pin model revisions and the SGLang image with environment
+variables:
 
 ```powershell
-$env:QWEN38_MODEL_REVISION="<target-commit-sha>"
-$env:QWEN38_DRAFT_MODEL_REVISION="<draft-commit-sha>"
-uv run modal deploy deploy/modal_app.py
-```
-
-Bash:
-
-```bash
-QWEN38_MODEL_REVISION="<target-commit-sha>" \
-QWEN38_DRAFT_MODEL_REVISION="<draft-commit-sha>" \
-uv run modal deploy deploy/modal_app.py
-```
-
-Changing these build arguments causes the CPU preparation step to target the
-new snapshots.
-
-## SGLang image policy
-
-Default:
-
-```text
-lmsysorg/sglang:dev-cu13
-```
-
-DFlash2 support is checked during Modal image construction:
-
-```python
-from sglang.srt.models.dflash import DFlash2DraftModel
-```
-
-For stronger reproducibility, use a known-good pinned SGLang image:
-
-```powershell
+$env:QWEN38_MODEL_REVISION="<commit>"
+$env:QWEN38_DRAFT_MODEL_REVISION="<commit>"
 $env:QWEN38_SGLANG_IMAGE="lmsysorg/sglang:<known-good-tag>"
-uv run modal run deploy/modal_app.py --max-tokens 2048
+uv run modal deploy deploy/modal_app.py
 ```
 
-## Storage cleanup
-
-The old deployment used the Volume:
-
-```text
-qwen38-27b-hf-cache
-```
-
-The optimized deployment no longer uses it. After verifying the new
-`qwen38-27b-model-store` works, the old cache Volume can be removed manually if
-you no longer need it.
-
-Do not delete `qwen38-27b-model-store` unless you want the CPU build step to
-download the model snapshots again.
-
-## Updating upstream
-
-Normal fork maintenance remains separate:
-
-```text
-upstream changes
-    |
-    +--> README.md / start.sh / stop.sh / patch/
-              |
-              +---- no runtime dependency ----> deploy/
-```
-
-When upstream finds a better serving recipe, port only the desired parameter
-changes into `deploy/modal_config.py`. Do not source values dynamically from
-`start.sh`; that would recreate the coupling this directory is designed to
-avoid.
+Upstream serving improvements should be deliberately ported into
+`modal_config.py`; the Modal backend should never source configuration from
+`start.sh` at runtime.
