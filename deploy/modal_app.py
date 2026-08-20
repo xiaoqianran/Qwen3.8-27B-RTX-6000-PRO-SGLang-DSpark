@@ -181,7 +181,6 @@ def _warmup() -> None:
         COMPILE_CACHE_PATH: compile_cache,
     },
     startup_timeout=CONFIG.startup_timeout_minutes * MINUTE,
-    target_concurrency=CONFIG.modal_target_concurrency,
     min_containers=0,
     max_containers=CONFIG.modal_max_containers,
     exit_grace_period=CONFIG.exit_grace_period_seconds,
