@@ -46,11 +46,11 @@ class ServingConfig:
     chunked_prefill_size: int = 4096
     max_prefill_tokens: int = 4096
 
-    # Match the upstream serving recipe: one RTX PRO 6000 replica may run
-    # up to eight active SGLang requests, while Modal targets eight concurrent
-    # HTTP requests per replica before autoscaling additional containers.
+    # One RTX PRO 6000 only. SGLang may run up to eight active requests inside
+    # that single container; Modal is not allowed to autoscale a second GPU.
     max_running_requests: int = 8
     modal_target_concurrency: int = 8
+    modal_max_containers: int = 1
 
     speculative_algorithm: str = "DFLASH"
     speculative_num_draft_tokens: int = 8
