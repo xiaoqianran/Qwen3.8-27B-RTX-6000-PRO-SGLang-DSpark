@@ -32,12 +32,12 @@ compile_cache = modal.Volume.from_name(
     CONFIG.compile_cache_volume_name, create_if_missing=True
 )
 
-# CPU-only image: its only job is to populate the persistent model Volume.
+# CPU-only build: download model snapshots into the persistent Volume.
+# run_function includes the source package of download_models automatically.
 prepare_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("huggingface_hub[hf_xet]==1.26.0")
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
-    .add_local_python_source("deploy")
     .run_function(
         download_models,
         volumes={MODEL_STORE_PATH: model_store},
@@ -61,15 +61,17 @@ prepare_image = (
     timeout=60,
 )
 def model_store_ready() -> bool:
-    """Build anchor plus an explicit readiness check for `modal run`."""
     validate_model_store()
     return True
 
 
-# GPU image: no Hugging Face client/download step is attached to this image.
+# GPU runtime: model network access is disabled and /models is mounted read-only.
+# Legacy Modal builders downgrade typing_extensions to 4.12.2; restore the
+# version shipped by the SGLang image before validating the full DFlash2 import.
 sglang_image = (
     modal.Image.from_registry(CONFIG.sglang_image)
     .entrypoint([])
+    .uv_pip_install("typing_extensions==4.16.0")
     .env(
         {
             "HF_HUB_OFFLINE": "1",
@@ -81,10 +83,9 @@ sglang_image = (
         }
     )
     .run_commands(
-        "grep -q 'class DFlash2DraftModel' "
-        "/sgl-workspace/sglang/python/sglang/srt/models/dflash.py"
+        "python3 -c \"from sglang.srt.models.dflash import "
+        "DFlash2DraftModel; print('DFlash2 import: OK')\""
     )
-    .add_local_python_source("deploy")
 )
 
 
@@ -151,14 +152,6 @@ class Qwen38Server:
         validate_model_store()
 
         subprocess.run(
-            [
-                "python3",
-                "-c",
-                "import sglang; print('SGLang', getattr(sglang, '__version__', 'unknown'))",
-            ],
-            check=True,
-        )
-        subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
             check=False,
         )
@@ -186,6 +179,7 @@ async def main(max_tokens: int = 1024):
     if max_tokens < 128:
         raise ValueError("--max-tokens must be >= 128")
 
+    # Finish CPU preparation before requesting the single RTX PRO 6000.
     await model_store_ready.remote.aio()
     url = await Qwen38Server.get_url.aio()
     await asyncio.to_thread(
