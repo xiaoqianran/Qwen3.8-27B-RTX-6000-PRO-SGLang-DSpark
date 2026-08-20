@@ -31,8 +31,10 @@ TRANSFORMERS_OFFLINE=1
 ```
 
 CPU preparation resolves each Hugging Face revision, downloads all shards, and
-writes a manifest. Before GPU allocation, the readiness check verifies the
-configured repositories and every safetensors shard referenced by an index.
+writes a manifest. Before the temporary benchmark requests a GPU, a CPU
+readiness function verifies the configured repositories and every safetensors
+shard referenced by an index. GPU startup validates the same store again before
+launching SGLang.
 
 A separate `qwen38-27b-compile-cache` Volume persists Triton, TorchInductor,
 and SGLang compilation artifacts.
@@ -44,6 +46,7 @@ dependencies into the SGLang Python environment.
 
 ```bash
 uv run modal workspace settings set image-builder-version 2025.06
+uv run modal workspace settings list
 ```
 
 The root project pins `modal[api-proxy-support]==1.5.3` for local proxy support.
@@ -68,14 +71,16 @@ uv run modal deploy deploy/modal_app.py
 The deployed server has:
 
 ```text
-min_containers             0
-max_containers             1
-Modal target concurrency   8
+min_containers              0
+max_containers              1
+Modal target_concurrency    unset (no horizontal autoscaling target)
 SGLang max running requests 8
 ```
 
-So it can scale from zero to exactly one RTX PRO 6000, but never to a second GPU.
-All 1–8 active requests are handled by the same SGLang process on that one card.
+Concurrency belongs to SGLang, not the Modal autoscaler. All 1–8 active requests
+are handled by the same SGLang process on the same RTX PRO 6000. The hard
+`max_containers=1` cap prevents a second GPU container from being started; this
+also means rolling redeploys cannot use a temporary spare replica.
 
 ## Default inference profile
 
@@ -89,7 +94,6 @@ KV cache                  fp8_e4m3
 Context                   262144
 mem-fraction-static       0.90
 SGLang running requests   8
-Modal target concurrency  8
 Modal max containers      1
 ```
 
@@ -104,6 +108,11 @@ $env:QWEN38_DRAFT_MODEL_REVISION="<commit>"
 $env:QWEN38_SGLANG_IMAGE="lmsysorg/sglang:<known-good-tag-or-digest>"
 uv run modal deploy deploy/modal_app.py
 ```
+
+The endpoint is currently `unauthenticated=True`, which is convenient for direct
+OpenAI-compatible clients but makes possession of the URL sufficient to trigger
+the single paid GPU. Add Modal Proxy authentication before treating this as a
+public production endpoint.
 
 Upstream serving improvements should be deliberately ported into
 `modal_config.py`; the Modal backend never sources runtime configuration from
