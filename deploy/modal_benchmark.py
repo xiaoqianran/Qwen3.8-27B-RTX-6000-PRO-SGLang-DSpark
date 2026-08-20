@@ -48,7 +48,9 @@ def run_single_stream_benchmark(
     request_started = time.perf_counter()
     first_output_at: float | None = None
     completion_tokens: int | None = None
+    finish_reason: str | None = None
     finished_at: float | None = None
+    saw_done = False
 
     with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         for raw_line in response:
@@ -58,6 +60,7 @@ def run_single_stream_benchmark(
 
             data = line[5:].strip()
             if data == "[DONE]":
+                saw_done = True
                 finished_at = time.perf_counter()
                 break
             if not data:
@@ -73,6 +76,9 @@ def run_single_stream_benchmark(
                 completion_tokens = int(usage["completion_tokens"])
 
             for choice in event.get("choices") or []:
+                if choice.get("finish_reason") is not None:
+                    finish_reason = str(choice["finish_reason"])
+
                 delta = choice.get("delta") or {}
                 content = delta.get("content")
                 reasoning = delta.get("reasoning_content")
@@ -84,10 +90,24 @@ def run_single_stream_benchmark(
                 if emitted and first_output_at is None:
                     first_output_at = time.perf_counter()
 
-    if finished_at is None:
-        finished_at = time.perf_counter()
+    if not saw_done:
+        raise RuntimeError(
+            "Streaming benchmark ended before the OpenAI SSE [DONE] marker; "
+            "the response was truncated."
+        )
+    if finished_at is None or first_output_at is None:
+        raise RuntimeError("Streaming benchmark completed without an output token.")
+    if completion_tokens is None:
+        raise RuntimeError(
+            "Streaming benchmark completed without usage.completion_tokens."
+        )
 
     total_seconds = finished_at - request_started
+    ttft = first_output_at - request_started
+    decode_seconds = max(finished_at - first_output_at, 1e-9)
+    decode_tokens = max(completion_tokens - 1, 0)
+    decode_tps = decode_tokens / decode_seconds
+    end_to_end_tps = completion_tokens / total_seconds
 
     print()
     print("=" * 76)
@@ -95,28 +115,12 @@ def run_single_stream_benchmark(
     print("=" * 76)
     print(f"Endpoint:          {base_url}")
     print(f"Requested tokens:  {max_tokens}")
+    print(f"Completion tokens: {completion_tokens}")
+    print(f"Finish reason:     {finish_reason or 'unknown'}")
     print(f"Total time:        {total_seconds:.3f} s")
-
-    if first_output_at is None:
-        print("No streamed output token observed.")
-        print("=" * 76)
-        return
-
-    ttft = first_output_at - request_started
-    decode_seconds = max(finished_at - first_output_at, 1e-9)
     print(f"Observed TTFT:     {ttft:.3f} s")
     print(f"Decode window:     {decode_seconds:.3f} s")
-
-    if completion_tokens is None:
-        print("Completion tokens: unavailable from stream usage")
-        print("Decode tok/s:      unavailable")
-    else:
-        decode_tokens = max(completion_tokens - 1, 0)
-        decode_tps = decode_tokens / decode_seconds
-        end_to_end_tps = completion_tokens / total_seconds
-        print(f"Completion tokens: {completion_tokens}")
-        print(f"DECODE TOK/S:      {decode_tps:.2f}")
-        print(f"End-to-end tok/s:  {end_to_end_tps:.2f}")
-
+    print(f"DECODE TOK/S:      {decode_tps:.2f}")
+    print(f"End-to-end tok/s:  {end_to_end_tps:.2f}")
     print("=" * 76)
     print("Cross-check with SGLang's decode throughput in the Modal server logs.")
