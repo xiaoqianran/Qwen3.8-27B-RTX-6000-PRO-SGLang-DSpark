@@ -87,6 +87,12 @@ are also explicit so this memory assumption cannot drift with a future SGLang
 default. DFlash2's draft model is pure attention, but speculative verification
 still uses target-model recurrent state.
 
+The validated boot auto-sized the shared KV pool to 958,178 tokens. The 262,144
+context setting is a per-request upper bound, not a promise that eight requests
+can each keep a full 256K context resident simultaneously. Concurrent requests
+share that KV pool; SGLang remains responsible for scheduling/retraction under
+long-context pressure.
+
 `--min-free-slots-delay` is intentionally not overridden. The RTX PRO 6000
 profile keeps the 2048-token prefill chunk and the observed 16384-token maximum
 prefill budget. CUDA graph shape lists and FlashInfer autotune choices remain
