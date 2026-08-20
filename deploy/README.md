@@ -134,22 +134,34 @@ The image also restores `typing_extensions==4.16.0` as a compatibility guard.
 
 ## Run
 
-Single-stream benchmark:
+The benchmark default is now **4096 output tokens per request**:
 
 ```bash
-uv run modal run deploy/modal_app.py --max-tokens 2048
+uv run modal run deploy/modal_app.py
 ```
 
-Specific concurrency:
+Long single-stream benchmark:
 
 ```bash
-uv run modal run deploy/modal_app.py --max-tokens 1024 --concurrency 8
+uv run modal run deploy/modal_app.py --max-tokens 8192
 ```
 
-One-container concurrency sweep:
+Specific eight-way concurrency at 4096 tokens per request:
 
 ```bash
-uv run modal run deploy/modal_app.py --max-tokens 1024 --concurrency 1,2,4,8
+uv run modal run deploy/modal_app.py --max-tokens 4096 --concurrency 8
+```
+
+Full one-container concurrency sweep at 4096 tokens per request:
+
+```bash
+uv run modal run deploy/modal_app.py --max-tokens 4096 --concurrency 1,2,4,8
+```
+
+Heavier 8K-token sweep:
+
+```bash
+uv run modal run deploy/modal_app.py --max-tokens 8192 --concurrency 1,2,4,8
 ```
 
 The comma-separated concurrency levels are executed sequentially against the
@@ -159,8 +171,10 @@ to avoid benchmarking an accidentally identical full prefix.
 
 Every request must supply both the OpenAI SSE `[DONE]` marker and
 `usage.completion_tokens`; a truncated request fails the whole level. The
-benchmark reports per-request TTFT and decode tok/s plus average user decode
-speed and aggregate end-to-end throughput.
+streaming benchmark timeout is 60 minutes so longer 4K/8K multi-request tests
+are not prematurely terminated by the local client. The benchmark reports
+per-request TTFT and decode tok/s plus average user decode speed and aggregate
+end-to-end throughput.
 
 Persistent endpoint:
 
