@@ -50,8 +50,8 @@ FusedKVMaterializeHelper
 should_apply_lm_head_quant_method
 ```
 
-It also verifies that the base server exposes `--max-mamba-cache-size`. No RTX
-PRO 6000 is allocated for these checks.
+It also verifies that the base server exposes `--max-mamba-cache-size` and
+`--cuda-graph-bs-prefill`. No RTX PRO 6000 is allocated for these checks.
 
 ## RTX PRO 6000 profile
 
@@ -95,13 +95,52 @@ long-context pressure.
 
 `--min-free-slots-delay` is intentionally not overridden. The RTX PRO 6000
 profile keeps the 2048-token prefill chunk and the observed 16384-token maximum
-prefill budget. CUDA graph shape lists and FlashInfer autotune choices remain
-owned by SGLang instead of being frozen in this deployment.
+prefill budget.
 
-After SGLang startup, autotune, CUDA-graph capture, and warmup complete, the
-writable compile-cache Volume is explicitly committed. Modal also performs
-background/final Volume commits, but the explicit commit makes cache persistence
-part of the startup contract instead of relying only on container teardown.
+## Cold-start optimization
+
+Cold-start work on `main` is isolated from the stable `v0.1.0` tag. See
+[`COLD_START.md`](./COLD_START.md) for the full design and A/B protocol.
+
+Disk-backed runtime artifacts now use a versioned cache namespace keyed by the
+resolved target/draft revisions and runtime configuration. The cache persists
+Triton, TorchInductor, SGLang, and FlashInfer autotune artifacts and is explicitly
+committed after warmup.
+
+The default profile remains the validated full CUDA-graph profile. A `fast`
+profile reduces the 42 prefill graph shapes to these 10 buckets while preserving
+the 2048-token chunk ceiling:
+
+```text
+4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
+```
+
+Prepare the default/full cache without running a long benchmark:
+
+```powershell
+Remove-Item Env:QWEN38_COLD_START_PROFILE -ErrorAction SilentlyContinue
+uv run modal run deploy/modal_app.py --cache-only
+```
+
+Prepare/test the fast profile:
+
+```powershell
+$env:QWEN38_COLD_START_PROFILE="fast"
+uv run modal run deploy/modal_app.py --cache-only
+uv run modal run deploy/modal_app.py --max-tokens 4096 --concurrency 1,2,4,8
+```
+
+Run each `--cache-only` command twice when measuring disk-cache reuse: the first
+run seeds the versioned cache and the second run measures a hit. Startup prints:
+
+```text
+Runtime cache: profile=... key=... flashinfer_entries_before=...
+Runtime cache committed: key=... flashinfer_entries=before->after
+Cold-start timing: engine_ready=... warmup=... cache_commit=... total=...
+```
+
+Set `QWEN38_RUNTIME_CACHE_EPOCH` to a new value to deliberately invalidate all
+runtime artifacts without deleting older cache namespaces.
 
 ## Lifecycle
 
@@ -134,7 +173,7 @@ The image also restores `typing_extensions==4.16.0` as a compatibility guard.
 
 ## Run
 
-The benchmark default is now **4096 output tokens per request**:
+The benchmark default is **4096 output tokens per request**:
 
 ```bash
 uv run modal run deploy/modal_app.py
