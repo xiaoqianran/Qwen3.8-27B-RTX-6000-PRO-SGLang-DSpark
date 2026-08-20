@@ -228,6 +228,7 @@ def _parse_concurrency_levels(spec: str) -> list[int]:
 class Qwen38Server:
     @modal.enter()
     def startup(self):
+        startup_started = time.perf_counter()
         _validate_models()
 
         subprocess.run(
@@ -258,14 +259,25 @@ class Qwen38Server:
             start_new_session=True,
         )
         _wait_ready(self.process)
+        ready_at = time.perf_counter()
         _warmup()
+        warm_at = time.perf_counter()
 
         flashinfer_after = flashinfer_entry_count(self.runtime_cache)
         compile_cache.commit()
+        committed_at = time.perf_counter()
         print(
             "Runtime cache committed:",
             f"key={self.runtime_cache.key}",
             f"flashinfer_entries={self.runtime_cache.flashinfer_entries_before}->{flashinfer_after}",
+            flush=True,
+        )
+        print(
+            "Cold-start timing:",
+            f"engine_ready={ready_at - startup_started:.2f}s",
+            f"warmup={warm_at - ready_at:.2f}s",
+            f"cache_commit={committed_at - warm_at:.2f}s",
+            f"total={committed_at - startup_started:.2f}s",
             flush=True,
         )
 
