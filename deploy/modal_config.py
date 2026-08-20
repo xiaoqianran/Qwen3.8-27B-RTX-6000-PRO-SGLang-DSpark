@@ -46,10 +46,9 @@ class ServingConfig:
     chunked_prefill_size: int = 4096
     max_prefill_tokens: int = 4096
 
-    # One RTX PRO 6000 only. SGLang may run up to eight active requests inside
-    # that single container; Modal is not allowed to autoscale a second GPU.
+    # Exactly one Modal GPU container. Concurrency is handled inside that
+    # singleton by SGLang; no Modal target_concurrency autoscaling is enabled.
     max_running_requests: int = 8
-    modal_target_concurrency: int = 8
     modal_max_containers: int = 1
 
     speculative_algorithm: str = "DFLASH"
