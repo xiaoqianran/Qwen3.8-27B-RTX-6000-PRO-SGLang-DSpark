@@ -29,8 +29,6 @@ from deploy.model_prepare import download_models, validate_model_store
 MINUTE = 60
 HOUR = 60 * MINUTE
 
-# Source is attached explicitly to each runtime image below. This avoids Modal
-# adding the same local package implicitly as well.
 app = modal.App(CONFIG.app_name, include_source=False)
 model_store = modal.Volume.from_name(CONFIG.model_volume_name, create_if_missing=True)
 model_store_ro = model_store.with_mount_options(read_only=True)
@@ -38,8 +36,8 @@ compile_cache = modal.Volume.from_name(
     CONFIG.compile_cache_volume_name, create_if_missing=True
 )
 
-# CPU-only build step. Model/revision/path settings are kwargs because Modal
-# includes run_function kwargs in the image build cache key.
+# CPU-only build step. Model/revision/path settings are kwargs so they are part
+# of Modal's image-build cache key.
 prepare_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("huggingface_hub[hf_xet]==1.26.0")
@@ -60,7 +58,6 @@ prepare_image = (
         cpu=CONFIG.download_cpu,
         timeout=CONFIG.download_timeout_hours * HOUR,
     )
-    # Local source mounts must be the final image operation unless copy=True.
     .add_local_python_source("deploy")
 )
 
@@ -86,13 +83,30 @@ def model_store_ready() -> bool:
     return True
 
 
-# GPU runtime. No Hugging Face downloader is installed here and both HF clients
-# are forced offline. Restore typing_extensions for legacy Modal image builders,
-# then fail during image build if DFlash2 cannot be imported.
+# GPU runtime. The repository's qwen38 image predates DFlash2, so bake the
+# existing patch/sglang compatibility layer into the Modal image. This is the
+# same backport used by start.sh, without running Docker inside Modal.
 sglang_image = (
     modal.Image.from_registry(CONFIG.sglang_image)
     .entrypoint([])
+    # Legacy Modal builders may downgrade this dependency inside third-party
+    # images; restore the version required by the SGLang/Pydantic stack.
     .uv_pip_install("typing_extensions==4.16.0")
+    .add_local_dir(
+        "patch/sglang",
+        "/tmp/sglang-patch",
+        copy=True,
+        ignore=["README.md"],
+    )
+    .run_commands(
+        "cp -a /tmp/sglang-patch/kernels/. "
+        "/sgl-workspace/sglang/python/sglang/kernels/ && "
+        "cp -a /tmp/sglang-patch/srt/. "
+        "/sgl-workspace/sglang/python/sglang/srt/ && "
+        "rm -rf /tmp/sglang-patch",
+        "python3 -c \"from sglang.srt.models.dflash import "
+        "DFlash2DraftModel; print('DFlash2 import: OK')\"",
+    )
     .env(
         {
             "HF_HUB_OFFLINE": "1",
@@ -102,10 +116,6 @@ sglang_image = (
             "TORCHINDUCTOR_CACHE_DIR": TORCHINDUCTOR_CACHE_PATH,
             "SGLANG_CACHE_DIR": SGLANG_CACHE_PATH,
         }
-    )
-    .run_commands(
-        "python3 -c \"from sglang.srt.models.dflash import "
-        "DFlash2DraftModel; print('DFlash2 import: OK')\""
     )
     .add_local_python_source("deploy")
 )
@@ -138,7 +148,7 @@ def _wait_ready(process: subprocess.Popen) -> None:
 
 
 def _wait_for_public_server(base_url: str) -> None:
-    """Trigger zero-to-one scaling and retry Modal's expected cold-start 503s."""
+    """Trigger zero-to-one scaling and retry expected cold-start failures."""
     deadline = time.monotonic() + CONFIG.startup_timeout_minutes * MINUTE
     health_url = base_url.rstrip("/") + "/health"
 
@@ -220,8 +230,8 @@ async def main(max_tokens: int = 1024):
     if max_tokens < 128:
         raise ValueError("--max-tokens must be >= 128")
 
-    # CPU preparation must finish before the first request can allocate the
-    # single RTX PRO 6000 container.
+    # CPU preparation finishes before the first request can allocate the single
+    # RTX PRO 6000 container.
     await model_store_ready.remote.aio()
     url = await Qwen38Server.get_url.aio()
     await asyncio.to_thread(_wait_for_public_server, url)
