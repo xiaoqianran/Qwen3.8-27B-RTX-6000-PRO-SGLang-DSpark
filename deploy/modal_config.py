@@ -51,8 +51,8 @@ class ServingConfig:
     mamba_radix_cache_strategy: str = "extra_buffer"
     mamba_ssm_dtype: str = "float32"
 
-    # Keep exactly one GPU replica. Modal may route up to the same eight
-    # concurrent HTTP requests into that replica before the autoscaler queues.
+    # One GPU replica only. app.py uses max_running_requests as Modal's
+    # autoscaling target too; excess demand can queue but cannot add a 2nd GPU.
     modal_max_containers: int = 1
 
     speculative_algorithm: str = "DFLASH"
