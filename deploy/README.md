@@ -127,6 +127,10 @@ Temporary benchmark:
 uv run modal run deploy/modal_app.py --max-tokens 2048
 ```
 
+The benchmark only reports success after the stream supplies both the OpenAI
+SSE `[DONE]` marker and `usage.completion_tokens`. A truncated connection is a
+hard failure instead of being mistaken for a completed performance run.
+
 Persistent endpoint:
 
 ```bash
