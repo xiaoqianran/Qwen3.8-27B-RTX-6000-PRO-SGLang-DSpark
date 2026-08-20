@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".release/*.json"
+  workflow_dispatch:
+    inputs:
+      manifest:
+        description: "Release manifest path, e.g. .release/v0.1.0.json"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve manifest
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            manifest='${{ inputs.manifest }}'
+          else
+            manifest="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" -- '.release/*.json' | head -n 1)"
+          fi
+
+          if [[ -z "$manifest" || ! -f "$manifest" ]]; then
+            echo "Release manifest not found: $manifest" >&2
+            exit 1
+          fi
+
+          tag="$(jq -r '.tag' "$manifest")"
+          title="$(jq -r '.title' "$manifest")"
+          notes_file="$(jq -r '.notes_file' "$manifest")"
+          prerelease="$(jq -r '.prerelease // false' "$manifest")"
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release tag: $tag" >&2
+            exit 1
+          fi
+          if [[ -z "$title" || "$title" == "null" ]]; then
+            echo "Release title is required" >&2
+            exit 1
+          fi
+          if [[ -z "$notes_file" || "$notes_file" == "null" || ! -f "$notes_file" ]]; then
+            echo "Release notes file not found: $notes_file" >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+          echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.manifest.outputs.tag }}
+          TITLE: ${{ steps.manifest.outputs.title }}
+          NOTES_FILE: ${{ steps.manifest.outputs.notes_file }}
+          PRERELEASE: ${{ steps.manifest.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to do."
+            exit 0
+          fi
+
+          args=(
+            release create "$TAG"
+            --repo "$GITHUB_REPOSITORY"
+            --title "$TITLE"
+            --notes-file "$NOTES_FILE"
+            --target "$GITHUB_SHA"
+            --latest
+          )
+
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh "${args[@]}"
