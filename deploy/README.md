@@ -37,6 +37,22 @@ The default profile is optimized for **single-user decode latency/throughput**:
 
 All of those settings live in `modal_config.py`.
 
+## Local Modal client with API proxy support
+
+The root `pyproject.toml` depends on:
+
+```text
+modal[api-proxy-support]==1.5.3
+```
+
+This is equivalent to installing the proxy-enabled Modal client directly with:
+
+```bash
+uv pip install 'modal[api-proxy-support]'
+```
+
+Use the project through `uv run` so the proxy extra is always present in the local environment.
+
 ## Run
 
 From the repository root:
