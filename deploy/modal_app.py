@@ -65,6 +65,16 @@ prepare_image = (
 )
 
 
+def _validate_models() -> None:
+    validate_model_store(
+        MODEL_STORE_PATH,
+        TARGET_MODEL_PATH,
+        DRAFT_MODEL_PATH,
+        CONFIG.model_id,
+        CONFIG.draft_model_id,
+    )
+
+
 @app.function(
     image=prepare_image,
     volumes={MODEL_STORE_PATH: model_store_ro},
@@ -72,7 +82,7 @@ prepare_image = (
     timeout=60,
 )
 def model_store_ready() -> bool:
-    validate_model_store(MODEL_STORE_PATH, TARGET_MODEL_PATH, DRAFT_MODEL_PATH)
+    _validate_models()
     return True
 
 
@@ -180,7 +190,7 @@ def _warmup() -> None:
 class Qwen38Server:
     @modal.enter()
     def startup(self):
-        validate_model_store(MODEL_STORE_PATH, TARGET_MODEL_PATH, DRAFT_MODEL_PATH)
+        _validate_models()
 
         subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
