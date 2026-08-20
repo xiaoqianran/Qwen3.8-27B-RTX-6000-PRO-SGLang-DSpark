@@ -30,6 +30,27 @@ class ServingConfig:
     model_volume_name: str = "qwen38-27b-model-store"
     compile_cache_volume_name: str = "qwen38-27b-compile-cache"
 
+    # Cold-start A/B profile. `full` is the v0.1.0 behavior. `fast` keeps a
+    # sparse power-of-two prefill CUDA-graph set while preserving 2048 coverage.
+    cold_start_profile: str = os.environ.get(
+        "QWEN38_COLD_START_PROFILE", "full"
+    ).strip().lower()
+    runtime_cache_epoch: str = os.environ.get(
+        "QWEN38_RUNTIME_CACHE_EPOCH", "1"
+    ).strip()
+    fast_prefill_cuda_graph_tokens: tuple[int, ...] = (
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        256,
+        512,
+        1024,
+        2048,
+    )
+
     download_cpu: int = 8
     download_max_workers: int = 16
     download_timeout_hours: int = 4
@@ -68,6 +89,18 @@ class ServingConfig:
     exit_grace_period_seconds: int = 300
     shutdown_timeout_seconds: int = 20
 
+    def __post_init__(self) -> None:
+        if self.cold_start_profile not in {"full", "fast"}:
+            raise ValueError(
+                "QWEN38_COLD_START_PROFILE must be either 'full' or 'fast'"
+            )
+        if not self.runtime_cache_epoch:
+            raise ValueError("QWEN38_RUNTIME_CACHE_EPOCH must not be empty")
+        if self.fast_prefill_cuda_graph_tokens[-1] != self.chunked_prefill_size:
+            raise ValueError(
+                "fast prefill CUDA-graph coverage must reach chunked_prefill_size"
+            )
+
 
 CONFIG = ServingConfig()
 
@@ -76,16 +109,42 @@ TARGET_MODEL_PATH = f"{MODEL_STORE_PATH}/target"
 DRAFT_MODEL_PATH = f"{MODEL_STORE_PATH}/draft"
 
 COMPILE_CACHE_PATH = "/compile-cache"
-TRITON_CACHE_PATH = f"{COMPILE_CACHE_PATH}/triton"
-TORCHINDUCTOR_CACHE_PATH = f"{COMPILE_CACHE_PATH}/torchinductor"
-SGLANG_CACHE_PATH = f"{COMPILE_CACHE_PATH}/sglang"
+
+
+def runtime_cache_identity() -> dict[str, object]:
+    c = CONFIG
+    return {
+        "epoch": c.runtime_cache_epoch,
+        "sglang_image": c.sglang_image,
+        "gpu": c.gpu,
+        "profile": c.cold_start_profile,
+        "prefill_cuda_graph_tokens": (
+            list(c.fast_prefill_cuda_graph_tokens)
+            if c.cold_start_profile == "fast"
+            else "sglang-default"
+        ),
+        "attention_backend": c.attention_backend,
+        "kv_cache_dtype": c.kv_cache_dtype,
+        "mem_fraction_static": c.mem_fraction_static,
+        "context_length": c.context_length,
+        "chunked_prefill_size": c.chunked_prefill_size,
+        "max_prefill_tokens": c.max_prefill_tokens,
+        "max_running_requests": c.max_running_requests,
+        "mamba_cache_size": c.max_running_requests * c.mamba_slots_per_request,
+        "mamba_radix_cache_strategy": c.mamba_radix_cache_strategy,
+        "mamba_ssm_dtype": c.mamba_ssm_dtype,
+        "speculative_algorithm": c.speculative_algorithm,
+        "speculative_num_draft_tokens": c.speculative_num_draft_tokens,
+        "speculative_draft_quantization": c.speculative_draft_quantization,
+        "speculative_draft_attention_backend": c.speculative_draft_attention_backend,
+    }
 
 
 def build_sglang_command(port: int | None = None) -> list[str]:
     c = CONFIG
     listen_port = c.port if port is None else port
 
-    return [
+    command = [
         "python3",
         "-m",
         "sglang.launch_server",
@@ -124,16 +183,30 @@ def build_sglang_command(port: int | None = None) -> list[str]:
         c.speculative_draft_quantization,
         "--speculative-draft-attention-backend",
         c.speculative_draft_attention_backend,
-        "--reasoning-parser",
-        "qwen3",
-        "--tool-call-parser",
-        "qwen3_coder",
-        "--sampling-defaults",
-        "model",
-        "--decode-log-interval",
-        str(c.decode_log_interval),
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(listen_port),
     ]
+
+    if c.cold_start_profile == "fast":
+        command.extend(
+            [
+                "--cuda-graph-bs-prefill",
+                *[str(value) for value in c.fast_prefill_cuda_graph_tokens],
+            ]
+        )
+
+    command.extend(
+        [
+            "--reasoning-parser",
+            "qwen3",
+            "--tool-call-parser",
+            "qwen3_coder",
+            "--sampling-defaults",
+            "model",
+            "--decode-log-interval",
+            str(c.decode_log_interval),
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(listen_port),
+        ]
+    )
+    return command
