@@ -1,10 +1,4 @@
-"""Configuration for the independent Modal deployment.
-
-Only this module should need routine edits when changing the GPU, SGLang
-image, model IDs, model revisions, or serving parameters. It deliberately has
-no dependency on start.sh, stop.sh, patch/, or any other upstream-fork runtime
-file.
-"""
+"""Configuration for the Modal deployment."""
 
 from __future__ import annotations
 
@@ -18,9 +12,11 @@ class ServingConfig:
     gpu: str = "RTX-PRO-6000"
     port: int = 8000
 
+    # Match the repository's proven bare-metal recipe. DFlash2 is supplied by
+    # the shared patch/sglang compatibility layer until an official image ships it.
     sglang_image: str = os.environ.get(
         "QWEN38_SGLANG_IMAGE",
-        "lmsysorg/sglang:dev-cu13",
+        "lmsysorg/sglang:qwen38-27b",
     )
 
     model_id: str = "RadixArk/Qwen3.8-27B-NVFP4"
@@ -46,8 +42,8 @@ class ServingConfig:
     chunked_prefill_size: int = 4096
     max_prefill_tokens: int = 4096
 
-    # Exactly one Modal GPU container. Concurrency is handled inside that
-    # singleton by SGLang; no Modal target_concurrency autoscaling is enabled.
+    # Exactly one Modal GPU container. SGLang handles up to eight active
+    # requests inside that singleton.
     max_running_requests: int = 8
     modal_max_containers: int = 1
 
@@ -76,7 +72,6 @@ SGLANG_CACHE_PATH = f"{COMPILE_CACHE_PATH}/sglang"
 
 
 def build_sglang_command(port: int | None = None) -> list[str]:
-    """Build SGLang CLI using only local model paths on the Modal Volume."""
     c = CONFIG
     listen_port = c.port if port is None else port
 
