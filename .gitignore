@@ -2,3 +2,8 @@
 .cache/
 .sglang.log
 .sglang.pid
+
+# Python / uv tooling
+.venv/
+__pycache__/
+*.py[cod]
