@@ -55,34 +55,57 @@ PRO 6000 is allocated for these checks.
 
 ## RTX PRO 6000 profile
 
-The defaults follow the current SGLang RTX PRO 6000 + NVFP4 baseline and then
-add DFlash2:
+The defaults follow the current SGLang RTX PRO 6000 + NVFP4 baseline and the
+configuration that completed a real Modal boot with DFlash2:
 
 ```text
-GPU                         RTX-PRO-6000
-SGLang image                lmsysorg/sglang:qwen38-27b
-Target                      RadixArk/Qwen3.8-27B-NVFP4
-Draft                       z-lab/Qwen3.8-27B-DFlash2
-Attention                   flashinfer
-KV cache                    fp8_e4m3
-Context                     262144
-mem-fraction-static         0.85
-chunked-prefill-size        2048
-DFlash2 draft tokens        8
-SGLang max running requests 8
-max-mamba-cache-size        40
-Modal max containers        1
+GPU                          RTX-PRO-6000
+SGLang image                 lmsysorg/sglang:qwen38-27b
+Target                       RadixArk/Qwen3.8-27B-NVFP4
+Draft                        z-lab/Qwen3.8-27B-DFlash2
+Attention                    flashinfer
+KV cache                     fp8_e4m3
+Context                      262144
+mem-fraction-static          0.85
+chunked-prefill-size         2048
+max-prefill-tokens           16384
+Mamba radix strategy         extra_buffer
+Mamba SSM dtype              float32
+DFlash2 draft tokens         8
+SGLang max running requests  8
+max-mamba-cache-size         40
+Modal target concurrency     8
+Modal max containers         1
+Modal shutdown request grace 300 s
 ```
 
-Qwen3.8 is a hybrid-GDN model. With the default `extra_buffer` strategy and the
-overlap scheduler, the target needs five base recurrent-state slots per active
-request. `8 × 5 = 40`, so the explicit Mamba-cache pin prevents the state pool
-from silently reducing the requested eight-way SGLang concurrency. DFlash2's
-draft model is pure attention, but speculative verification still uses the
-target model's recurrent state and therefore does not remove this requirement.
+Qwen3.8 is a hybrid-GDN model. With `extra_buffer` and the overlap scheduler,
+the target needs five base recurrent-state slots per active request. `8 × 5 =
+40`, so the explicit Mamba-cache pin prevents the state pool from silently
+reducing the requested eight-way SGLang concurrency. The strategy and SSM dtype
+are also explicit so this memory assumption cannot drift with a future SGLang
+default. DFlash2's draft model is pure attention, but speculative verification
+still uses target-model recurrent state.
 
-`--min-free-slots-delay` is intentionally not overridden, and the RTX PRO 6000
-cookbook's 2048 prefill chunk is used instead of the older fork's 4096 value.
+`--min-free-slots-delay` is intentionally not overridden. The RTX PRO 6000
+profile keeps the 2048-token prefill chunk and the observed 16384-token maximum
+prefill budget. CUDA graph shape lists and FlashInfer autotune choices remain
+owned by SGLang instead of being frozen in this deployment.
+
+## Lifecycle
+
+SGLang runs as a subprocess in its own process session. Modal is configured to
+route up to eight concurrent HTTP requests into the single GPU replica, while
+`max_containers=1` guarantees that autoscaling cannot allocate a second GPU.
+
+`exit_grace_period=300` gives an in-flight long generation time to finish when a
+Server is being removed. The `@modal.exit` handler then gives SGLang 20 seconds
+to terminate and force-kills its process group only if graceful shutdown stalls.
+
+`modal run` is temporary. After its local benchmark returns, Modal tears down the
+temporary Server, so a final SGLang `SIGTERM`/shutdown sequence in remote logs is
+expected. `modal deploy` creates the persistent endpoint; it remains deployed
+while still allowing the GPU replica count to scale between zero and one.
 
 ## One-time Modal workspace setup
 
@@ -112,10 +135,11 @@ uv run modal deploy deploy/modal_app.py
 Runtime limits are deliberately simple:
 
 ```text
-min_containers   0
-max_containers   1
-GPU replicas     0 or 1
-SGLang requests  up to 8 inside that one GPU
+min_containers       0
+max_containers       1
+target_concurrency   8
+GPU replicas         0 or 1
+SGLang requests      up to 8 inside that one GPU
 ```
 
 The local benchmark retries expected 502/503/504 responses while the Modal
