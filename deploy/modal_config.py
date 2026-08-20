@@ -12,8 +12,8 @@ class ServingConfig:
     gpu: str = "RTX-PRO-6000"
     port: int = 8000
 
-    # Match the repository's proven bare-metal recipe. DFlash2 is supplied by
-    # the shared patch/sglang compatibility layer until an official image ships it.
+    # Match the Qwen3.8 cookbook image. DFlash2 is supplied by the repository's
+    # shared patch/sglang backport until a verified official image includes it.
     sglang_image: str = os.environ.get(
         "QWEN38_SGLANG_IMAGE",
         "lmsysorg/sglang:qwen38-27b",
@@ -35,16 +35,19 @@ class ServingConfig:
     download_timeout_hours: int = 4
     server_cpu: int = 8
 
-    mem_fraction_static: float = 0.90
+    # Current SGLang RTX PRO 6000 + NVFP4 baseline.
+    mem_fraction_static: float = 0.85
     context_length: int = 262_144
     kv_cache_dtype: str = "fp8_e4m3"
     attention_backend: str = "flashinfer"
-    chunked_prefill_size: int = 4096
-    max_prefill_tokens: int = 4096
+    chunked_prefill_size: int = 2048
 
-    # Exactly one Modal GPU container. SGLang handles up to eight active
-    # requests inside that singleton.
+    # Exactly one Modal GPU container. Qwen3.8's hybrid-GDN target uses five
+    # base recurrent-state slots per active request with the default
+    # extra_buffer strategy + overlap scheduler. Pin 8*5=40 slots so SGLang
+    # cannot silently clamp the requested eight-way concurrency below 8.
     max_running_requests: int = 8
+    mamba_slots_per_request: int = 5
     modal_max_containers: int = 1
 
     speculative_algorithm: str = "DFLASH"
@@ -52,9 +55,7 @@ class ServingConfig:
     speculative_draft_quantization: str = "unquant"
     speculative_draft_attention_backend: str = "flashinfer"
 
-    min_free_slots_delay: int = 1
     decode_log_interval: int = 50
-
     startup_timeout_minutes: int = 30
     exit_grace_period_seconds: int = 15
 
@@ -94,10 +95,10 @@ def build_sglang_command(port: int | None = None) -> list[str]:
         str(c.context_length),
         "--max-running-requests",
         str(c.max_running_requests),
+        "--max-mamba-cache-size",
+        str(c.max_running_requests * c.mamba_slots_per_request),
         "--chunked-prefill-size",
         str(c.chunked_prefill_size),
-        "--max-prefill-tokens",
-        str(c.max_prefill_tokens),
         "--speculative-algorithm",
         c.speculative_algorithm,
         "--speculative-draft-model-path",
@@ -108,8 +109,6 @@ def build_sglang_command(port: int | None = None) -> list[str]:
         c.speculative_draft_quantization,
         "--speculative-draft-attention-backend",
         c.speculative_draft_attention_backend,
-        "--min-free-slots-delay",
-        str(c.min_free_slots_delay),
         "--reasoning-parser",
         "qwen3",
         "--tool-call-parser",
