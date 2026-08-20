@@ -56,7 +56,7 @@ PRO 6000 is allocated for these checks.
 ## RTX PRO 6000 profile
 
 The defaults follow the current SGLang RTX PRO 6000 + NVFP4 baseline and the
-configuration that completed a real Modal boot with DFlash2:
+configuration that completed real Modal boots with DFlash2:
 
 ```text
 GPU                          RTX-PRO-6000
@@ -98,6 +98,11 @@ profile keeps the 2048-token prefill chunk and the observed 16384-token maximum
 prefill budget. CUDA graph shape lists and FlashInfer autotune choices remain
 owned by SGLang instead of being frozen in this deployment.
 
+After SGLang startup, autotune, CUDA-graph capture, and warmup complete, the
+writable compile-cache Volume is explicitly committed. Modal also performs
+background/final Volume commits, but the explicit commit makes cache persistence
+part of the startup contract instead of relying only on container teardown.
+
 ## Lifecycle
 
 SGLang runs as a subprocess in its own process session. Modal's autoscaling
@@ -111,8 +116,10 @@ to terminate and force-kills its process group only if graceful shutdown stalls.
 
 `modal run` is temporary. After its local benchmark returns, Modal tears down the
 temporary Server, so a final SGLang `SIGTERM`/shutdown sequence in remote logs is
-expected. `modal deploy` creates the persistent endpoint; it remains deployed
-while still allowing the GPU replica count to scale between zero and one.
+expected. The validated v02 run exited with zero remaining requests and no
+shutdown traceback. `modal deploy` creates the persistent endpoint; it remains
+deployed while still allowing the GPU replica count to scale between zero and
+one.
 
 ## One-time Modal workspace setup
 
@@ -127,15 +134,33 @@ The image also restores `typing_extensions==4.16.0` as a compatibility guard.
 
 ## Run
 
-Temporary benchmark:
+Single-stream benchmark:
 
 ```bash
 uv run modal run deploy/modal_app.py --max-tokens 2048
 ```
 
-The benchmark only reports success after the stream supplies both the OpenAI
-SSE `[DONE]` marker and `usage.completion_tokens`. A truncated connection is a
-hard failure instead of being mistaken for a completed performance run.
+Specific concurrency:
+
+```bash
+uv run modal run deploy/modal_app.py --max-tokens 1024 --concurrency 8
+```
+
+One-container concurrency sweep:
+
+```bash
+uv run modal run deploy/modal_app.py --max-tokens 1024 --concurrency 1,2,4,8
+```
+
+The comma-separated concurrency levels are executed sequentially against the
+same warm GPU container. Each level launches its requests together and never
+exceeds SGLang's configured maximum of eight. Prompts include a per-request ID
+to avoid benchmarking an accidentally identical full prefix.
+
+Every request must supply both the OpenAI SSE `[DONE]` marker and
+`usage.completion_tokens`; a truncated request fails the whole level. The
+benchmark reports per-request TTFT and decode tok/s plus average user decode
+speed and aggregate end-to-end throughput.
 
 Persistent endpoint:
 
