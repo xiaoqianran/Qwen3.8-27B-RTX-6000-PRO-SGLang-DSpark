@@ -29,7 +29,11 @@ from deploy.model_prepare import download_models, validate_model_store
 MINUTE = 60
 HOUR = 60 * MINUTE
 
-app = modal.App(CONFIG.app_name, include_source=False)
+# Keep the App source module enabled. When this file is invoked as
+# `modal run deploy/modal_app.py`, Modal records the defining module as
+# `modal_app`; disabling source inclusion makes remote @app.server hydration
+# fail with `ModuleNotFoundError: No module named 'modal_app'`.
+app = modal.App(CONFIG.app_name, include_source=True)
 model_store = modal.Volume.from_name(CONFIG.model_volume_name, create_if_missing=True)
 model_store_ro = model_store.with_mount_options(read_only=True)
 compile_cache = modal.Volume.from_name(
