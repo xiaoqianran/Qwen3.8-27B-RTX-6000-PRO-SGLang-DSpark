@@ -36,8 +36,9 @@ compile_cache = modal.Volume.from_name(
     CONFIG.compile_cache_volume_name, create_if_missing=True
 )
 
-# CPU-only build step. Model/revision/path settings are kwargs so they are part
-# of Modal's image-build cache key.
+# CPU-only model preparation. If revisions are unpinned, rerun this cheap build
+# step on deploy so Hugging Face's moving default branch cannot be hidden behind
+# Modal's image cache. snapshot_download still reuses the persistent Volume.
 prepare_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("huggingface_hub[hf_xet]==1.26.0")
@@ -57,6 +58,10 @@ prepare_image = (
         },
         cpu=CONFIG.download_cpu,
         timeout=CONFIG.download_timeout_hours * HOUR,
+        force_build=(
+            CONFIG.model_revision is None
+            or CONFIG.draft_model_revision is None
+        ),
     )
     .add_local_python_source("deploy")
 )
@@ -83,14 +88,12 @@ def model_store_ready() -> bool:
     return True
 
 
-# GPU runtime. The repository's qwen38 image predates DFlash2, so bake the
-# existing patch/sglang compatibility layer into the Modal image. This is the
-# same backport used by start.sh, without running Docker inside Modal.
+# The cookbook qwen38 image predates DFlash2. Bake the repository's existing
+# compatibility overlay into the image, then validate the integration before a
+# GPU can ever be allocated.
 sglang_image = (
     modal.Image.from_registry(CONFIG.sglang_image)
     .entrypoint([])
-    # Legacy Modal builders may downgrade this dependency inside third-party
-    # images; restore the version required by the SGLang/Pydantic stack.
     .uv_pip_install("typing_extensions==4.16.0")
     .add_local_dir(
         "patch/sglang",
@@ -104,8 +107,13 @@ sglang_image = (
         "cp -a /tmp/sglang-patch/srt/. "
         "/sgl-workspace/sglang/python/sglang/srt/ && "
         "rm -rf /tmp/sglang-patch",
-        "python3 -c \"from sglang.srt.models.dflash import "
-        "DFlash2DraftModel; print('DFlash2 import: OK')\"",
+        "python3 -c \""
+        "from sglang.kernels.ops.speculative.fused_kv_materialize import FusedKVMaterializeHelper; "
+        "from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method; "
+        "from sglang.srt.models.dflash import DFlash2DraftModel; "
+        "from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2; "
+        "print('DFlash2 runtime imports: OK')\"",
+        "python3 -m sglang.launch_server --help | grep -q -- '--max-mamba-cache-size'",
     )
     .env(
         {
