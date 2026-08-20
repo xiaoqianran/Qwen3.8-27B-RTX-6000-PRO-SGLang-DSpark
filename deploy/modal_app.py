@@ -19,21 +19,16 @@ from deploy.modal_config import (
     CONFIG,
     DRAFT_MODEL_PATH,
     MODEL_STORE_PATH,
-    SGLANG_CACHE_PATH,
     TARGET_MODEL_PATH,
-    TORCHINDUCTOR_CACHE_PATH,
-    TRITON_CACHE_PATH,
     build_sglang_command,
+    runtime_cache_identity,
 )
 from deploy.model_prepare import download_models, validate_model_store
+from deploy.runtime_cache import flashinfer_entry_count, prepare_runtime_cache
 
 MINUTE = 60
 HOUR = 60 * MINUTE
 
-# Keep the App source module enabled. When this file is invoked as
-# `modal run deploy/modal_app.py`, Modal records the defining module as
-# `modal_app`; disabling source inclusion makes remote @app.server hydration
-# fail with `ModuleNotFoundError: No module named 'modal_app'`.
 app = modal.App(CONFIG.app_name, include_source=True)
 model_store = modal.Volume.from_name(CONFIG.model_volume_name, create_if_missing=True)
 model_store_ro = model_store.with_mount_options(read_only=True)
@@ -41,9 +36,6 @@ compile_cache = modal.Volume.from_name(
     CONFIG.compile_cache_volume_name, create_if_missing=True
 )
 
-# CPU-only model preparation. If revisions are unpinned, rerun this cheap build
-# step on deploy so Hugging Face's moving default branch cannot be hidden behind
-# Modal's image cache. snapshot_download still reuses the persistent Volume.
 prepare_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("huggingface_hub[hf_xet]==1.26.0")
@@ -93,9 +85,6 @@ def model_store_ready() -> bool:
     return True
 
 
-# The cookbook qwen38 image predates DFlash2. Bake the repository's existing
-# compatibility overlay into the image, then validate the integration before a
-# GPU can ever be allocated.
 sglang_image = (
     modal.Image.from_registry(CONFIG.sglang_image)
     .entrypoint([])
@@ -119,19 +108,25 @@ sglang_image = (
         "from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2; "
         "print('DFlash2 runtime imports: OK')\"",
         "python3 -m sglang.launch_server --help | grep -q -- '--max-mamba-cache-size'",
+        "python3 -m sglang.launch_server --help | grep -q -- '--cuda-graph-bs-prefill'",
     )
     .env(
         {
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
             "TOKENIZERS_PARALLELISM": "false",
-            "TRITON_CACHE_DIR": TRITON_CACHE_PATH,
-            "TORCHINDUCTOR_CACHE_DIR": TORCHINDUCTOR_CACHE_PATH,
-            "SGLANG_CACHE_DIR": SGLANG_CACHE_PATH,
+            "SGLANG_FLASHINFER_AUTOTUNE_CACHE": "1",
+            "QWEN38_COLD_START_PROFILE": CONFIG.cold_start_profile,
+            "QWEN38_RUNTIME_CACHE_EPOCH": CONFIG.runtime_cache_epoch,
+            "QWEN38_SGLANG_IMAGE": CONFIG.sglang_image,
         }
     )
     .add_local_python_source("deploy")
 )
+
+# Modal documents this as a small but useful cold-start prefetch hint for SGLang.
+with sglang_image.imports():
+    import sglang  # noqa: F401
 
 
 def _http_json(url: str, payload: dict, timeout: float = 180) -> dict:
@@ -161,7 +156,6 @@ def _wait_ready(process: subprocess.Popen) -> None:
 
 
 def _wait_for_public_server(base_url: str) -> None:
-    """Trigger zero-to-one scaling and retry expected cold-start failures."""
     deadline = time.monotonic() + CONFIG.startup_timeout_minutes * MINUTE
     health_url = base_url.rstrip("/") + "/health"
 
@@ -241,17 +235,39 @@ class Qwen38Server:
             check=False,
         )
 
+        self.runtime_cache = prepare_runtime_cache(
+            compile_cache_dir=COMPILE_CACHE_PATH,
+            model_store_dir=MODEL_STORE_PATH,
+            identity=runtime_cache_identity(),
+        )
+        print(
+            "Runtime cache:",
+            f"profile={CONFIG.cold_start_profile}",
+            f"key={self.runtime_cache.key}",
+            f"flashinfer_entries_before={self.runtime_cache.flashinfer_entries_before}",
+            flush=True,
+        )
+
         command = build_sglang_command()
+        process_env = os.environ.copy()
+        process_env.update(self.runtime_cache.env)
         print("Launching:", " ".join(command), flush=True)
         self.process = subprocess.Popen(
             command,
-            env=os.environ.copy(),
+            env=process_env,
             start_new_session=True,
         )
         _wait_ready(self.process)
         _warmup()
+
+        flashinfer_after = flashinfer_entry_count(self.runtime_cache)
         compile_cache.commit()
-        print("Compile cache committed.", flush=True)
+        print(
+            "Runtime cache committed:",
+            f"key={self.runtime_cache.key}",
+            f"flashinfer_entries={self.runtime_cache.flashinfer_entries_before}->{flashinfer_after}",
+            flush=True,
+        )
 
     @modal.exit()
     def shutdown(self):
@@ -271,16 +287,24 @@ class Qwen38Server:
 
 
 @app.local_entrypoint()
-async def main(max_tokens: int = 4096, concurrency: str = "1"):
+async def main(
+    max_tokens: int = 4096,
+    concurrency: str = "1",
+    cache_only: bool = False,
+):
     if max_tokens < 128:
         raise ValueError("--max-tokens must be >= 128")
     levels = _parse_concurrency_levels(concurrency)
 
-    # CPU preparation finishes before the first request can allocate the single
-    # RTX PRO 6000 container.
     await model_store_ready.remote.aio()
     url = await Qwen38Server.get_url.aio()
     await asyncio.to_thread(_wait_for_public_server, url)
+
+    if cache_only:
+        print(
+            "Runtime cache prepared; the temporary `modal run` Server will now stop."
+        )
+        return
 
     for level in levels:
         await asyncio.to_thread(
