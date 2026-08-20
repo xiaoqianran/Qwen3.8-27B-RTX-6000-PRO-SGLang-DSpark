@@ -41,13 +41,18 @@ class ServingConfig:
     kv_cache_dtype: str = "fp8_e4m3"
     attention_backend: str = "flashinfer"
     chunked_prefill_size: int = 2048
+    max_prefill_tokens: int = 16_384
 
-    # Exactly one Modal GPU container. Qwen3.8's hybrid-GDN target uses five
-    # base recurrent-state slots per active request with the default
-    # extra_buffer strategy + overlap scheduler. Pin 8*5=40 slots so SGLang
-    # cannot silently clamp the requested eight-way concurrency below 8.
+    # Qwen3.8's hybrid-GDN target needs five base recurrent-state slots per
+    # active request with extra_buffer + overlap. Pin both the strategy/dtype
+    # and 8*5=40 slots so later SGLang defaults cannot change this budget.
     max_running_requests: int = 8
     mamba_slots_per_request: int = 5
+    mamba_radix_cache_strategy: str = "extra_buffer"
+    mamba_ssm_dtype: str = "float32"
+
+    # Keep exactly one GPU replica. Modal may route up to the same eight
+    # concurrent HTTP requests into that replica before the autoscaler queues.
     modal_max_containers: int = 1
 
     speculative_algorithm: str = "DFLASH"
@@ -57,7 +62,11 @@ class ServingConfig:
 
     decode_log_interval: int = 50
     startup_timeout_minutes: int = 30
-    exit_grace_period_seconds: int = 15
+
+    # Let an in-flight long generation finish before Modal tears down a Server.
+    # The @modal.exit handler itself uses a much shorter subprocess wait.
+    exit_grace_period_seconds: int = 300
+    shutdown_timeout_seconds: int = 20
 
 
 CONFIG = ServingConfig()
@@ -97,8 +106,14 @@ def build_sglang_command(port: int | None = None) -> list[str]:
         str(c.max_running_requests),
         "--max-mamba-cache-size",
         str(c.max_running_requests * c.mamba_slots_per_request),
+        "--mamba-radix-cache-strategy",
+        c.mamba_radix_cache_strategy,
+        "--mamba-ssm-dtype",
+        c.mamba_ssm_dtype,
         "--chunked-prefill-size",
         str(c.chunked_prefill_size),
+        "--max-prefill-tokens",
+        str(c.max_prefill_tokens),
         "--speculative-algorithm",
         c.speculative_algorithm,
         "--speculative-draft-model-path",
