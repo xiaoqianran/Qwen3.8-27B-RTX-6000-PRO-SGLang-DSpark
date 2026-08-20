@@ -63,7 +63,8 @@ jobs:
           echo "notes_file=$notes_file" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
-      - name: Create tag and release
+      - name: Create or verify tag and release
+        id: release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.manifest.outputs.tag }}
@@ -74,22 +75,52 @@ jobs:
         run: |
           set -euo pipefail
 
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; nothing to do."
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            args=(
+              release create "$TAG"
+              --repo "$GITHUB_REPOSITORY"
+              --title "$TITLE"
+              --notes-file "$NOTES_FILE"
+              --target "$GITHUB_SHA"
+              --latest
+            )
+
+            if [[ "$PRERELEASE" == "true" ]]; then
+              args+=(--prerelease)
+            fi
+
+            gh "${args[@]}"
+          else
+            echo "Release $TAG already exists; verifying it."
+          fi
+
+          release_url="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json url --jq '.url')"
+          echo "url=$release_url" >> "$GITHUB_OUTPUT"
+          echo "Verified release: $release_url"
+
+      - name: Record release status
+        env:
+          TAG: ${{ steps.manifest.outputs.tag }}
+          RELEASE_URL: ${{ steps.release.outputs.url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .release/status
+          status_file=".release/status/${TAG}.txt"
+          cat > "$status_file" <<EOF
+          tag=$TAG
+          release_url=$RELEASE_URL
+          target_commit=$GITHUB_SHA
+          workflow_run_id=$GITHUB_RUN_ID
+          verified_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$status_file"
+          if git diff --cached --quiet; then
+            echo "Release status already recorded."
             exit 0
           fi
-
-          args=(
-            release create "$TAG"
-            --repo "$GITHUB_REPOSITORY"
-            --title "$TITLE"
-            --notes-file "$NOTES_FILE"
-            --target "$GITHUB_SHA"
-            --latest
-          )
-
-          if [[ "$PRERELEASE" == "true" ]]; then
-            args+=(--prerelease)
-          fi
-
-          gh "${args[@]}"
+          git commit -m "Record ${TAG} release status"
+          git push
