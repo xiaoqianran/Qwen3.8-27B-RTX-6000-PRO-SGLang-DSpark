@@ -1,0 +1,59 @@
+name: Validate Modal deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "deploy/**"
+      - ".github/workflows/validate-modal-deploy.yml"
+  pull_request:
+    paths:
+      - "deploy/**"
+      - ".github/workflows/validate-modal-deploy.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Compile Python sources
+        run: python -m py_compile deploy/*.py
+
+      - name: Validate full profile command
+        shell: bash
+        run: |
+          python - <<'PY'
+          from deploy.modal_config import CONFIG, build_sglang_command
+
+          command = build_sglang_command()
+          assert CONFIG.cold_start_profile == "full"
+          assert "--cuda-graph-bs-prefill" not in command
+          assert command[command.index("--max-running-requests") + 1] == "8"
+          assert command[command.index("--max-mamba-cache-size") + 1] == "40"
+          print("full profile: OK")
+          PY
+
+      - name: Validate fast profile command
+        shell: bash
+        env:
+          QWEN38_COLD_START_PROFILE: fast
+        run: |
+          python - <<'PY'
+          from deploy.modal_config import CONFIG, build_sglang_command
+
+          command = build_sglang_command()
+          flag = command.index("--cuda-graph-bs-prefill")
+          expected = ["4", "8", "16", "32", "64", "128", "256", "512", "1024", "2048"]
+          assert CONFIG.cold_start_profile == "fast"
+          assert command[flag + 1 : flag + 1 + len(expected)] == expected
+          assert command[flag + 1 + len(expected)] == "--reasoning-parser"
+          print("fast profile: OK")
+          PY
