@@ -271,7 +271,7 @@ class Qwen38Server:
 
 
 @app.local_entrypoint()
-async def main(max_tokens: int = 1024, concurrency: str = "1"):
+async def main(max_tokens: int = 4096, concurrency: str = "1"):
     if max_tokens < 128:
         raise ValueError("--max-tokens must be >= 128")
     levels = _parse_concurrency_levels(concurrency)
