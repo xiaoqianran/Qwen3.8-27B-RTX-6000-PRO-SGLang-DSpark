@@ -1,0 +1,5 @@
+tag=v0.1.0
+release_url=https://github.com/xiaoqianran/Qwen3.8-27B-RTX-6000-PRO-SGLang-DSpark/releases/tag/v0.1.0
+target_commit=a5e9d020fdb877cd18b3d197a37f6f3d258bd9dc
+workflow_run_id=32415788196
+verified_at=2026-08-20T20:45:18Z
