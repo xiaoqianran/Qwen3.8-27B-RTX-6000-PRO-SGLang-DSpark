@@ -137,7 +137,7 @@ def run_concurrency_benchmark(
     model_name: str,
     max_tokens: int,
     concurrency: int,
-    timeout_seconds: int = 1800,
+    timeout_seconds: int = 3600,
 ) -> None:
     if concurrency < 1:
         raise ValueError("concurrency must be >= 1")
@@ -194,7 +194,7 @@ def run_single_stream_benchmark(
     base_url: str,
     model_name: str,
     max_tokens: int,
-    timeout_seconds: int = 1800,
+    timeout_seconds: int = 3600,
 ) -> None:
     """Backward-compatible single-stream wrapper."""
     run_concurrency_benchmark(
