@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import time
+import urllib.error
 import urllib.request
 
 import modal
@@ -15,8 +16,10 @@ from deploy.modal_benchmark import run_single_stream_benchmark
 from deploy.modal_config import (
     COMPILE_CACHE_PATH,
     CONFIG,
+    DRAFT_MODEL_PATH,
     MODEL_STORE_PATH,
     SGLANG_CACHE_PATH,
+    TARGET_MODEL_PATH,
     TORCHINDUCTOR_CACHE_PATH,
     TRITON_CACHE_PATH,
     build_sglang_command,
@@ -26,14 +29,17 @@ from deploy.model_prepare import download_models, validate_model_store
 MINUTE = 60
 HOUR = 60 * MINUTE
 
-app = modal.App(CONFIG.app_name)
+# Source is attached explicitly to each runtime image below. This avoids Modal
+# adding the same local package implicitly as well.
+app = modal.App(CONFIG.app_name, include_source=False)
 model_store = modal.Volume.from_name(CONFIG.model_volume_name, create_if_missing=True)
+model_store_ro = model_store.with_mount_options(read_only=True)
 compile_cache = modal.Volume.from_name(
     CONFIG.compile_cache_volume_name, create_if_missing=True
 )
 
-# CPU-only build: download model snapshots into the persistent Volume.
-# run_function includes the source package of download_models automatically.
+# CPU-only build step. Model/revision/path settings are kwargs because Modal
+# includes run_function kwargs in the image build cache key.
 prepare_image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("huggingface_hub[hf_xet]==1.26.0")
@@ -41,33 +47,38 @@ prepare_image = (
     .run_function(
         download_models,
         volumes={MODEL_STORE_PATH: model_store},
-        args=(
-            CONFIG.model_id,
-            CONFIG.model_revision,
-            CONFIG.draft_model_id,
-            CONFIG.draft_model_revision,
-            CONFIG.download_max_workers,
-        ),
+        kwargs={
+            "target_repo": CONFIG.model_id,
+            "target_revision": CONFIG.model_revision,
+            "target_dir": TARGET_MODEL_PATH,
+            "draft_repo": CONFIG.draft_model_id,
+            "draft_revision": CONFIG.draft_model_revision,
+            "draft_dir": DRAFT_MODEL_PATH,
+            "model_store_dir": MODEL_STORE_PATH,
+            "max_workers": CONFIG.download_max_workers,
+        },
         cpu=CONFIG.download_cpu,
         timeout=CONFIG.download_timeout_hours * HOUR,
     )
+    # Local source mounts must be the final image operation unless copy=True.
+    .add_local_python_source("deploy")
 )
 
 
 @app.function(
     image=prepare_image,
-    volumes={MODEL_STORE_PATH: model_store.read_only()},
+    volumes={MODEL_STORE_PATH: model_store_ro},
     cpu=1,
     timeout=60,
 )
 def model_store_ready() -> bool:
-    validate_model_store()
+    validate_model_store(MODEL_STORE_PATH, TARGET_MODEL_PATH, DRAFT_MODEL_PATH)
     return True
 
 
-# GPU runtime: model network access is disabled and /models is mounted read-only.
-# Legacy Modal builders downgrade typing_extensions to 4.12.2; restore the
-# version shipped by the SGLang image before validating the full DFlash2 import.
+# GPU runtime. No Hugging Face downloader is installed here and both HF clients
+# are forced offline. Restore typing_extensions for legacy Modal image builders,
+# then fail during image build if DFlash2 cannot be imported.
 sglang_image = (
     modal.Image.from_registry(CONFIG.sglang_image)
     .entrypoint([])
@@ -86,6 +97,7 @@ sglang_image = (
         "python3 -c \"from sglang.srt.models.dflash import "
         "DFlash2DraftModel; print('DFlash2 import: OK')\""
     )
+    .add_local_python_source("deploy")
 )
 
 
@@ -115,6 +127,25 @@ def _wait_ready(process: subprocess.Popen) -> None:
     raise TimeoutError("SGLang startup timed out")
 
 
+def _wait_for_public_server(base_url: str) -> None:
+    """Trigger zero-to-one scaling and retry Modal's expected cold-start 503s."""
+    deadline = time.monotonic() + CONFIG.startup_timeout_minutes * MINUTE
+    health_url = base_url.rstrip("/") + "/health"
+
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(health_url, timeout=5):
+                return
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {502, 503, 504}:
+                raise
+        except urllib.error.URLError:
+            pass
+        time.sleep(2)
+
+    raise TimeoutError("Modal server did not become reachable before timeout")
+
+
 def _warmup() -> None:
     payload = {
         "model": CONFIG.served_model_name,
@@ -136,7 +167,7 @@ def _warmup() -> None:
     cpu=CONFIG.server_cpu,
     port=CONFIG.port,
     volumes={
-        MODEL_STORE_PATH: model_store.read_only(),
+        MODEL_STORE_PATH: model_store_ro,
         COMPILE_CACHE_PATH: compile_cache,
     },
     startup_timeout=CONFIG.startup_timeout_minutes * MINUTE,
@@ -149,7 +180,7 @@ def _warmup() -> None:
 class Qwen38Server:
     @modal.enter()
     def startup(self):
-        validate_model_store()
+        validate_model_store(MODEL_STORE_PATH, TARGET_MODEL_PATH, DRAFT_MODEL_PATH)
 
         subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
@@ -172,6 +203,7 @@ class Qwen38Server:
             process.wait(timeout=CONFIG.exit_grace_period_seconds)
         except subprocess.TimeoutExpired:
             process.kill()
+            process.wait(timeout=5)
 
 
 @app.local_entrypoint()
@@ -179,9 +211,11 @@ async def main(max_tokens: int = 1024):
     if max_tokens < 128:
         raise ValueError("--max-tokens must be >= 128")
 
-    # Finish CPU preparation before requesting the single RTX PRO 6000.
+    # CPU preparation must finish before the first request can allocate the
+    # single RTX PRO 6000 container.
     await model_store_ready.remote.aio()
     url = await Qwen38Server.get_url.aio()
+    await asyncio.to_thread(_wait_for_public_server, url)
     await asyncio.to_thread(
         run_single_stream_benchmark,
         url,
