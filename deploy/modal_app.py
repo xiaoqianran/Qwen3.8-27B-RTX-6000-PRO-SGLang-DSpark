@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import time
 import urllib.error
@@ -203,6 +204,7 @@ def _warmup() -> None:
         COMPILE_CACHE_PATH: compile_cache,
     },
     startup_timeout=CONFIG.startup_timeout_minutes * MINUTE,
+    target_concurrency=CONFIG.max_running_requests,
     min_containers=0,
     max_containers=CONFIG.modal_max_containers,
     exit_grace_period=CONFIG.exit_grace_period_seconds,
@@ -220,7 +222,11 @@ class Qwen38Server:
 
         command = build_sglang_command()
         print("Launching:", " ".join(command), flush=True)
-        self.process = subprocess.Popen(command, env=os.environ.copy())
+        self.process = subprocess.Popen(
+            command,
+            env=os.environ.copy(),
+            start_new_session=True,
+        )
         _wait_ready(self.process)
         _warmup()
 
@@ -229,11 +235,15 @@ class Qwen38Server:
         process = getattr(self, "process", None)
         if process is None or process.poll() is not None:
             return
+
         process.terminate()
         try:
-            process.wait(timeout=CONFIG.exit_grace_period_seconds)
+            process.wait(timeout=CONFIG.shutdown_timeout_seconds)
         except subprocess.TimeoutExpired:
-            process.kill()
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             process.wait(timeout=5)
 
 
@@ -253,3 +263,4 @@ async def main(max_tokens: int = 1024):
         CONFIG.served_model_name,
         max_tokens,
     )
+    print("Benchmark complete; the temporary `modal run` Server will now stop.")
