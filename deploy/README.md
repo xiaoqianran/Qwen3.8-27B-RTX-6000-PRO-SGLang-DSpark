@@ -17,7 +17,12 @@ qwen38-27b-model-store (persistent Volume)
         ▼
 lmsysorg/sglang:qwen38-27b + patch/sglang
         ▼
-max 1 × RTX PRO 6000
+always-on CPU Gateway (public `Qwen38Server` URL)
+        │
+        ├── cold GPU: OpenAI-compatible `cold-starting` responses
+        └── ready GPU: transparent HTTP/1.1 proxy
+        ▼
+max 1 × RTX PRO 6000 (`Qwen38Backend`)
         ▼
 SGLang + DFlash2 + FlashInfer
         └── max 8 active requests
@@ -142,6 +147,36 @@ Cold-start timing: engine_ready=... warmup=... cache_commit=... total=...
 Set `QWEN38_RUNTIME_CACHE_EPOCH` to a new value to deliberately invalidate all
 runtime artifacts without deleting older cache namespaces.
 
+## Cold-start gateway
+
+The public `Qwen38Server` endpoint is a one-container CPU gateway kept warm with
+`min_containers=1`. The RTX PRO 6000 backend remains scale-to-zero as
+`Qwen38Backend`. The gateway preserves the existing public `qwen38server` URL
+slug while preventing normal GPU cold starts from surfacing as Modal 502/503
+errors to Cherry Studio or other OpenAI-compatible clients.
+
+While the GPU is starting, the gateway responds with HTTP 200:
+
+```text
+GET  /health              -> cold_starting status + timing estimate
+GET  /v1/models            -> only synthetic model id `cold-starting`
+POST /v1/chat/completions  -> valid completion/SSE saying the model is starting
+```
+
+The real `qwen3.8-27b` model id is never exposed by the gateway until the GPU
+backend's `/health` returns 200. Streaming cold-start replies terminate with the
+normal OpenAI SSE `[DONE]` marker and include an empty usage chunk when the
+client requests `stream_options.include_usage=true`.
+
+The first estimate is 120 seconds. During one gateway container lifetime,
+observed cold-start durations are retained in memory and the median of the most
+recent eight boots becomes the next estimate. If a boot exceeds its estimate,
+the displayed estimate expands rather than reporting a false `0s` remaining.
+
+The gateway-to-backend client explicitly disables HTTP/2, and both Modal Server
+decorators use `h2_enabled=False`, keeping the SGLang/Uvicorn backend leg on
+HTTP/1.1.
+
 ## Lifecycle
 
 SGLang runs as a subprocess in its own process session. Modal's autoscaling
@@ -224,13 +259,14 @@ uv run modal deploy deploy/modal_app.py
 Runtime limits are deliberately simple:
 
 ```text
-min_containers       0
-max_containers       1
-target_concurrency   8
+Public CPU gateway   min 1 / max 1 / target concurrency 100
+GPU backend          min 0 / max 1 / target concurrency 8
 GPU replicas         0 or 1
 SGLang requests      up to 8 active inside that one GPU
 ```
 
-The local benchmark retries expected 502/503/504 responses while the Modal
-Server scales from zero. The endpoint is currently `unauthenticated=True`; add
-authentication before exposing a paid production endpoint publicly.
+The local benchmark intentionally targets `Qwen38Backend` directly and retries
+expected 502/503/504 responses while that GPU Server scales from zero. Normal
+external clients should use the public `Qwen38Server` gateway instead. Both
+endpoints are currently `unauthenticated=True`; add authentication before
+exposing a paid production endpoint publicly.

@@ -147,6 +147,20 @@ with sglang_image.imports():
     import sglang  # noqa: F401
 
 
+GATEWAY_PORT = 8080
+GATEWAY_COLD_START_ESTIMATE_SECONDS = 120
+
+gateway_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .uv_pip_install(
+        "fastapi==0.116.1",
+        "httpx==0.28.1",
+        "uvicorn==0.35.0",
+    )
+    .add_local_python_source("deploy")
+)
+
+
 def _http_json(url: str, payload: dict, timeout: float = 180) -> dict:
     request = urllib.request.Request(
         url,
@@ -245,7 +259,7 @@ def _parse_concurrency_levels(spec: str) -> list[int]:
     unauthenticated=True,
     h2_enabled=False,
 )
-class Qwen38Server:
+class Qwen38Backend:
     @modal.enter()
     def startup(self):
         startup_started = time.perf_counter()
@@ -326,6 +340,88 @@ class Qwen38Server:
             process.wait(timeout=5)
 
 
+def _wait_gateway_ready(process: subprocess.Popen) -> None:
+    deadline = time.monotonic() + 60
+    health_url = f"http://127.0.0.1:{GATEWAY_PORT}/_gateway/health"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"Cold-start gateway exited during startup: {process.returncode}"
+            )
+        try:
+            with urllib.request.urlopen(health_url, timeout=2):
+                return
+        except Exception:
+            time.sleep(0.5)
+    raise TimeoutError("Cold-start gateway did not become ready")
+
+
+@app.server(
+    image=gateway_image,
+    cpu=1,
+    port=GATEWAY_PORT,
+    startup_timeout=2 * MINUTE,
+    target_concurrency=100,
+    min_containers=1,
+    max_containers=1,
+    exit_grace_period=30,
+    unauthenticated=True,
+    h2_enabled=False,
+)
+class Qwen38Server:
+    """Always-on public gateway; preserves the existing qwen38server URL slug."""
+
+    @modal.enter()
+    def startup(self):
+        backend_url = Qwen38Backend.get_url()
+        process_env = os.environ.copy()
+        process_env.update(
+            {
+                "QWEN38_BACKEND_URL": backend_url,
+                "QWEN38_COLD_START_ESTIMATE_SECONDS": str(
+                    GATEWAY_COLD_START_ESTIMATE_SECONDS
+                ),
+            }
+        )
+        print(
+            "Launching cold-start gateway:",
+            f"backend={backend_url}",
+            f"estimate={GATEWAY_COLD_START_ESTIMATE_SECONDS}s",
+            flush=True,
+        )
+        self.process = subprocess.Popen(
+            [
+                "python3",
+                "-m",
+                "uvicorn",
+                "deploy.gateway:app",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                str(GATEWAY_PORT),
+                "--no-access-log",
+            ],
+            env=process_env,
+            start_new_session=True,
+        )
+        _wait_gateway_ready(self.process)
+
+    @modal.exit()
+    def shutdown(self):
+        process = getattr(self, "process", None)
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+
+
 @app.local_entrypoint()
 async def main(
     max_tokens: int = 4096,
@@ -337,7 +433,7 @@ async def main(
     levels = _parse_concurrency_levels(concurrency)
 
     await model_store_ready.remote.aio()
-    url = await Qwen38Server.get_url.aio()
+    url = await Qwen38Backend.get_url.aio()
     await asyncio.to_thread(_wait_for_public_server, url)
 
     if cache_only:
