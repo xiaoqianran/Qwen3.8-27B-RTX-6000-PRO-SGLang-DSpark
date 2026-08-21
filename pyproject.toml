@@ -7,5 +7,4 @@ dependencies = [
     "modal[api-proxy-support]==1.5.3",
     "fastapi==0.116.1",
     "httpx==0.28.1",
-    "uvicorn==0.35.0",
 ]

@@ -17,7 +17,7 @@ qwen38-27b-model-store (persistent Volume)
         ▼
 lmsysorg/sglang:qwen38-27b + patch/sglang
         ▼
-always-on CPU Gateway (public `Qwen38Server` URL)
+scale-to-zero CPU Gateway (public Modal ASGI Web Function URL)
         │
         ├── cold GPU: OpenAI-compatible `cold-starting` responses
         └── ready GPU: transparent HTTP/1.1 proxy
@@ -149,11 +149,18 @@ runtime artifacts without deleting older cache namespaces.
 
 ## Cold-start gateway
 
-The public `Qwen38Server` endpoint is a one-container CPU gateway kept warm with
-`min_containers=1`. The RTX PRO 6000 backend remains scale-to-zero as
-`Qwen38Backend`. The gateway preserves the existing public `qwen38server` URL
-slug while preventing normal GPU cold starts from surfacing as Modal 502/503
-errors to Cherry Studio or other OpenAI-compatible clients.
+The public `Qwen38Server` endpoint is a lightweight Modal ASGI Web Function with
+`cpu=0.125`, `min_containers=0`, `max_containers=1`, a 5-second scaledown window,
+and up to 100 concurrent inputs in its single lightweight container. The gateway
+therefore scales to zero when idle instead of keeping a CPU container resident.
+A request may pay a small CPU-function cold-start delay, but normal idle cost for
+the gateway is zero. The RTX PRO 6000 backend remains independently scale-to-zero
+as `Qwen38Backend`.
+
+Changing the gateway from `@app.server` to `@modal.asgi_app()` changes the public
+endpoint from a `modal.direct` Server URL to the Web Function URL emitted by
+`modal deploy` (normally under `modal.run`). The endpoint label is explicitly
+`qwen38server`; update Cherry Studio's base URL once after deploying this version.
 
 While the GPU is starting, the gateway responds with HTTP 200:
 
@@ -170,11 +177,13 @@ client requests `stream_options.include_usage=true`.
 
 The first estimate is 120 seconds. During one gateway container lifetime,
 observed cold-start durations are retained in memory and the median of the most
-recent eight boots becomes the next estimate. If a boot exceeds its estimate,
-the displayed estimate expands rather than reporting a false `0s` remaining.
+recent eight boots becomes the next estimate. Because the gateway itself can
+scale to zero, this history is intentionally ephemeral and resets with a new CPU
+container. If a boot exceeds its estimate, the displayed estimate expands
+rather than reporting a false `0s` remaining.
 
-The gateway-to-backend client explicitly disables HTTP/2, and both Modal Server
-decorators use `h2_enabled=False`, keeping the SGLang/Uvicorn backend leg on
+The gateway-to-backend client explicitly disables HTTP/2 and the GPU Modal
+Server uses `h2_enabled=False`, keeping the SGLang/Uvicorn backend leg on
 HTTP/1.1.
 
 ## Lifecycle
@@ -192,8 +201,8 @@ to terminate and force-kills its process group only if graceful shutdown stalls.
 temporary Server, so a final SGLang `SIGTERM`/shutdown sequence in remote logs is
 expected. The validated v02 run exited with zero remaining requests and no
 shutdown traceback. `modal deploy` creates the persistent endpoint; it remains
-deployed while still allowing the GPU replica count to scale between zero and
-one.
+deployed while still allowing the CPU gateway and GPU backend replicas to scale
+to zero independently.
 
 ## One-time Modal workspace setup
 
@@ -259,7 +268,7 @@ uv run modal deploy deploy/modal_app.py
 Runtime limits are deliberately simple:
 
 ```text
-Public CPU gateway   min 1 / max 1 / target concurrency 100
+Public CPU gateway   min 0 / max 1 / 0.125 CPU / 5 s scaledown / 100 inputs
 GPU backend          min 0 / max 1 / target concurrency 8
 GPU replicas         0 or 1
 SGLang requests      up to 8 active inside that one GPU
@@ -267,6 +276,7 @@ SGLang requests      up to 8 active inside that one GPU
 
 The local benchmark intentionally targets `Qwen38Backend` directly and retries
 expected 502/503/504 responses while that GPU Server scales from zero. Normal
-external clients should use the public `Qwen38Server` gateway instead. Both
-endpoints are currently `unauthenticated=True`; add authentication before
-exposing a paid production endpoint publicly.
+external clients should use the public `Qwen38Server` ASGI Web Function instead.
+The GPU backend is currently `unauthenticated=True`; the Web Function is public
+by default. Add authentication before exposing a paid production endpoint
+publicly.

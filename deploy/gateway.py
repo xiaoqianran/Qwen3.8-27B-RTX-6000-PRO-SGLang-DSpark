@@ -1,10 +1,11 @@
-"""Always-on HTTP gateway for the Modal SGLang backend.
+"""Scale-to-zero HTTP gateway for the Modal SGLang backend.
 
 The gateway keeps Cherry Studio/OpenAI-compatible clients away from Modal's
-transient 502/503 responses while the GPU Server scales from zero. During a
-cold start it returns valid OpenAI-shaped responses using the synthetic
-``cold-starting`` model. Once the backend is healthy it transparently proxies
-requests to SGLang.
+transient 502/503 responses while the GPU Server scales from zero. The gateway
+itself is a lightweight Modal ASGI web function that can also scale to zero.
+During a GPU cold start it returns valid OpenAI-shaped responses using the
+synthetic ``cold-starting`` model. Once the backend is healthy it transparently
+proxies requests to SGLang.
 """
 
 from __future__ import annotations
