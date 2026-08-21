@@ -243,6 +243,7 @@ def _parse_concurrency_levels(spec: str) -> list[int]:
     max_containers=CONFIG.modal_max_containers,
     exit_grace_period=CONFIG.exit_grace_period_seconds,
     unauthenticated=True,
+    h2_enabled=True,
 )
 class Qwen38Server:
     @modal.enter()
