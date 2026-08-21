@@ -85,6 +85,15 @@ def model_store_ready() -> bool:
     return True
 
 
+# Only require experimental CLI flags when the corresponding experiment is
+# explicitly enabled. This keeps the validated default image path fail-closed
+# without making an optional newer-SGLang feature a hard dependency.
+language_only_check = (
+    "python3 -m sglang.launch_server --help | grep -q -- '--language-only'"
+    if CONFIG.language_only
+    else "true"
+)
+
 sglang_image = (
     modal.Image.from_registry(CONFIG.sglang_image)
     .entrypoint([])
@@ -109,6 +118,8 @@ sglang_image = (
         "print('DFlash2 runtime imports: OK')\"",
         "python3 -m sglang.launch_server --help | grep -q -- '--max-mamba-cache-size'",
         "python3 -m sglang.launch_server --help | grep -q -- '--cuda-graph-bs-prefill'",
+        "python3 -m sglang.launch_server --help | grep -q -- '--cuda-graph-bs-decode'",
+        language_only_check,
     )
     .env(
         {
@@ -116,7 +127,13 @@ sglang_image = (
             "TRANSFORMERS_OFFLINE": "1",
             "TOKENIZERS_PARALLELISM": "false",
             "SGLANG_FLASHINFER_AUTOTUNE_CACHE": "1",
+            # SGLang's default /health path performs a real 1-token generation.
+            # We already run three explicit OpenAI warmups after readiness, so
+            # disable that redundant generation and let /health be status-only.
+            "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "0",
             "QWEN38_COLD_START_PROFILE": CONFIG.cold_start_profile,
+            "QWEN38_VERIFY_GRAPH_PROFILE": CONFIG.verify_graph_profile,
+            "QWEN38_LANGUAGE_ONLY": "1" if CONFIG.language_only else "0",
             "QWEN38_RUNTIME_CACHE_EPOCH": CONFIG.runtime_cache_epoch,
             "QWEN38_SGLANG_IMAGE": CONFIG.sglang_image,
         }
@@ -125,6 +142,7 @@ sglang_image = (
 )
 
 # Modal documents this as a small but useful cold-start prefetch hint for SGLang.
+# This is already active in main and deliberately remains before server startup.
 with sglang_image.imports():
     import sglang  # noqa: F401
 
@@ -140,8 +158,9 @@ def _http_json(url: str, payload: dict, timeout: float = 180) -> dict:
         return json.loads(response.read())
 
 
-def _wait_ready(process: subprocess.Popen) -> None:
-    deadline = time.monotonic() + CONFIG.startup_timeout_minutes * MINUTE
+def _wait_ready(process: subprocess.Popen) -> float:
+    started = time.monotonic()
+    deadline = started + CONFIG.startup_timeout_minutes * MINUTE
     health_url = f"http://127.0.0.1:{CONFIG.port}/health"
 
     while time.monotonic() < deadline:
@@ -149,7 +168,7 @@ def _wait_ready(process: subprocess.Popen) -> None:
             raise RuntimeError(f"SGLang exited during startup: {process.returncode}")
         try:
             with urllib.request.urlopen(health_url, timeout=2):
-                return
+                return time.monotonic() - started
         except Exception:
             time.sleep(2)
     raise TimeoutError("SGLang startup timed out")
@@ -244,6 +263,8 @@ class Qwen38Server:
         print(
             "Runtime cache:",
             f"profile={CONFIG.cold_start_profile}",
+            f"verify_profile={CONFIG.verify_graph_profile}",
+            f"language_only={CONFIG.language_only}",
             f"key={self.runtime_cache.key}",
             f"flashinfer_entries_before={self.runtime_cache.flashinfer_entries_before}",
             flush=True,
@@ -252,13 +273,17 @@ class Qwen38Server:
         command = build_sglang_command()
         process_env = os.environ.copy()
         process_env.update(self.runtime_cache.env)
+        # The base image currently carries a deprecated compatibility variable;
+        # it is not required by this deployment and only produces warning noise.
+        process_env.pop("SGLANG_FLASHINFER_PR4266_SOURCE", None)
         print("Launching:", " ".join(command), flush=True)
+        process_started = time.perf_counter()
         self.process = subprocess.Popen(
             command,
             env=process_env,
             start_new_session=True,
         )
-        _wait_ready(self.process)
+        health_wait = _wait_ready(self.process)
         ready_at = time.perf_counter()
         _warmup()
         warm_at = time.perf_counter()
@@ -274,6 +299,8 @@ class Qwen38Server:
         )
         print(
             "Cold-start timing:",
+            f"pre_launch={process_started - startup_started:.2f}s",
+            f"health_wait={health_wait:.2f}s",
             f"engine_ready={ready_at - startup_started:.2f}s",
             f"warmup={warm_at - ready_at:.2f}s",
             f"cache_commit={committed_at - warm_at:.2f}s",
