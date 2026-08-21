@@ -98,6 +98,14 @@ class ServingConfig:
     # autoscaling target too; excess demand can queue but cannot add a 2nd GPU.
     modal_max_containers: int = 1
 
+    # Keep the expensive GPU warm across normal pauses between interactive chat
+    # turns. This is intentionally much longer than the ~90-120 s cold boot.
+    # Override with QWEN38_GPU_SCALEDOWN_SECONDS when a different cost/latency
+    # trade-off is desired.
+    gpu_scaledown_window_seconds: int = int(
+        os.environ.get("QWEN38_GPU_SCALEDOWN_SECONDS", "600")
+    )
+
     speculative_algorithm: str = "DFLASH"
     speculative_num_draft_tokens: int = 8
     speculative_draft_quantization: str = "unquant"
@@ -122,6 +130,8 @@ class ServingConfig:
             )
         if not self.runtime_cache_epoch:
             raise ValueError("QWEN38_RUNTIME_CACHE_EPOCH must not be empty")
+        if self.gpu_scaledown_window_seconds < 1:
+            raise ValueError("QWEN38_GPU_SCALEDOWN_SECONDS must be >= 1")
         if self.fast_prefill_cuda_graph_tokens[-1] != self.chunked_prefill_size:
             raise ValueError(
                 "fast prefill CUDA-graph coverage must reach chunked_prefill_size"

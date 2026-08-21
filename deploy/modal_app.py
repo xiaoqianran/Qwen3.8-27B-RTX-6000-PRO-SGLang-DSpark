@@ -256,6 +256,7 @@ def _parse_concurrency_levels(spec: str) -> list[int]:
     target_concurrency=CONFIG.max_running_requests,
     min_containers=0,
     max_containers=CONFIG.modal_max_containers,
+    scaledown_window=CONFIG.gpu_scaledown_window_seconds,
     exit_grace_period=CONFIG.exit_grace_period_seconds,
     unauthenticated=True,
     h2_enabled=False,
@@ -342,6 +343,7 @@ class Qwen38Backend:
 
 
 @app.function(
+    name="Qwen38Gateway",
     image=gateway_image,
     cpu=GATEWAY_CPU,
     min_containers=0,

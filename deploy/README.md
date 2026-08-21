@@ -186,6 +186,12 @@ The gateway-to-backend client explicitly disables HTTP/2 and the GPU Modal
 Server uses `h2_enabled=False`, keeping the SGLang/Uvicorn backend leg on
 HTTP/1.1.
 
+The RTX PRO 6000 backend explicitly uses a 600-second idle scaledown window
+(default, overridable with `QWEN38_GPU_SCALEDOWN_SECONDS`). This keeps the GPU
+warm across ordinary pauses between Cherry Studio turns and is long enough that
+a 90-120 second cold boot cannot consume the entire idle lifetime. See
+[`AUTOSCALING.md`](./AUTOSCALING.md) for the lifecycle and shutdown semantics.
+
 ## Lifecycle
 
 SGLang runs as a subprocess in its own process session. Modal's autoscaling
@@ -269,7 +275,7 @@ Runtime limits are deliberately simple:
 
 ```text
 Public CPU gateway   min 0 / max 1 / 0.125 CPU / 5 s scaledown / 100 inputs
-GPU backend          min 0 / max 1 / target concurrency 8
+GPU backend          min 0 / max 1 / target concurrency 8 / 600 s scaledown
 GPU replicas         0 or 1
 SGLang requests      up to 8 active inside that one GPU
 ```
