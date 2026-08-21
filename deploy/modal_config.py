@@ -16,6 +16,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class ServingConfig:
     app_name: str = "qwen38-27b-modal"
+    gateway_app_name: str = "qwen38-27b-gateway"
     gpu: str = "RTX-PRO-6000"
     port: int = 8000
 

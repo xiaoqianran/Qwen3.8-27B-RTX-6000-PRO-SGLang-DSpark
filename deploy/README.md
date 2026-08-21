@@ -17,7 +17,7 @@ qwen38-27b-model-store (persistent Volume)
         ▼
 lmsysorg/sglang:qwen38-27b + patch/sglang
         ▼
-scale-to-zero CPU Gateway (public Modal ASGI Web Function URL)
+independent scale-to-zero CPU Gateway App (public Modal ASGI Web Function URL)
         │
         ├── cold GPU: OpenAI-compatible `cold-starting` responses
         └── ready GPU: transparent HTTP/1.1 proxy
@@ -149,7 +149,7 @@ runtime artifacts without deleting older cache namespaces.
 
 ## Cold-start gateway
 
-The public `Qwen38Server` endpoint is a lightweight Modal ASGI Web Function with
+The public `Qwen38Gateway` endpoint is a lightweight Modal ASGI Web Function with
 `cpu=0.125`, `min_containers=0`, `max_containers=1`, a 5-second scaledown window,
 and up to 100 concurrent inputs in its single lightweight container. The gateway
 therefore scales to zero when idle instead of keeping a CPU container resident.
@@ -162,25 +162,30 @@ endpoint from a `modal.direct` Server URL to the Web Function URL emitted by
 `modal deploy` (normally under `modal.run`). The endpoint label is explicitly
 `qwen38server`; update Cherry Studio's base URL once after deploying this version.
 
-While the GPU is starting, the gateway responds with HTTP 200:
+The gateway uses a strict user-level GPU wake policy:
 
 ```text
-GET  /health              -> cold_starting status + timing estimate
-GET  /v1/models            -> only synthetic model id `cold-starting`
-POST /v1/chat/completions  -> valid completion/SSE saying the model is starting
+GET  /_gateway/health      -> gateway only; NEVER wakes GPU
+GET  /health               -> heartbeat state only; NEVER wakes/extends GPU
+GET  /v1/models            -> state-driven list; NEVER wakes/extends GPU
+POST /v1/chat/completions  -> real user inference; MAY wake/extend GPU
 ```
 
-The real `qwen3.8-27b` model id is never exposed by the gateway until the GPU
-backend's `/health` returns 200. Streaming cold-start replies terminate with the
-normal OpenAI SSE `[DONE]` marker and include an empty usage chunk when the
-client requests `stream_options.include_usage=true`.
+While the GPU is starting, the inference route still returns a valid OpenAI
+completion/SSE with HTTP 200 instead of exposing the expected Modal Server 503.
+A lightweight Modal Dict heartbeat carries `idle`/`starting`/`ready` state, so
+Cherry Studio background discovery traffic does not need to probe SGLang.
 
-The first estimate is 120 seconds. During one gateway container lifetime,
-observed cold-start durations are retained in memory and the median of the most
-recent eight boots becomes the next estimate. Because the gateway itself can
-scale to zero, this history is intentionally ephemeral and resets with a new CPU
-container. If a boot exceeds its estimate, the displayed estimate expands
-rather than reporting a false `0s` remaining.
+The real `qwen3.8-27b` model id is never exposed by the gateway until the GPU
+backend reports `ready` after SGLang health, warmup, and cache commit complete.
+Streaming cold-start replies terminate with the normal OpenAI SSE `[DONE]`
+marker and include an empty usage chunk when the client requests
+`stream_options.include_usage=true`.
+
+The baseline estimate is 120 seconds. The shared runtime state stores the first
+user inference trigger timestamp, so elapsed/remaining time survives CPU Gateway
+scale-to-zero cycles. If a boot exceeds the estimate, the displayed estimate
+expands rather than reporting a false `0s` remaining.
 
 The gateway-to-backend client explicitly disables HTTP/2 and the GPU Modal
 Server uses `h2_enabled=False`, keeping the SGLang/Uvicorn backend leg on
@@ -265,11 +270,20 @@ are not prematurely terminated by the local client. The benchmark reports
 per-request TTFT and decode tok/s plus average user decode speed and aggregate
 end-to-end throughput.
 
-Persistent endpoint:
+Persistent deployment uses two independent Apps:
 
 ```bash
+# GPU backend. Deploy only when backend/SGLang code actually changed.
 uv run modal deploy deploy/modal_app.py
+
+# Lightweight public Gateway. Safe to redeploy without rolling the GPU backend.
+uv run modal deploy deploy/modal_gateway.py
 ```
+
+Do **not** routinely redeploy `deploy/modal_app.py` while users are actively
+generating. Modal deployment version changes can roll the Server revision after
+in-flight requests drain. Gateway-only changes belong in `modal_gateway.py`, so
+they do not touch the RTX PRO 6000 lifecycle.
 
 Runtime limits are deliberately simple:
 
@@ -282,7 +296,7 @@ SGLang requests      up to 8 active inside that one GPU
 
 The local benchmark intentionally targets `Qwen38Backend` directly and retries
 expected 502/503/504 responses while that GPU Server scales from zero. Normal
-external clients should use the public `Qwen38Server` ASGI Web Function instead.
+external clients should use the public `Qwen38Gateway` ASGI Web Function instead.
 The GPU backend is currently `unauthenticated=True`; the Web Function is public
 by default. Add authentication before exposing a paid production endpoint
 publicly.

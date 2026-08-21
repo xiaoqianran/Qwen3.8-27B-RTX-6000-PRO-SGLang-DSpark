@@ -27,6 +27,29 @@ jobs:
       - name: Compile Python sources
         run: python -m py_compile deploy/*.py
 
+      - name: Validate gateway no-wake policy
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+
+          tree = ast.parse(Path("deploy/gateway.py").read_text())
+          funcs = {
+              node.name: node
+              for node in tree.body
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+          }
+          for name in ("gateway_health", "health", "models"):
+              calls = [
+                  node.func.id
+                  for node in ast.walk(funcs[name])
+                  if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+              ]
+              assert "_proxy" not in calls, (name, calls)
+          print("gateway no-wake policy: OK")
+          PY
+
       - name: Validate full profile command
         shell: bash
         run: |

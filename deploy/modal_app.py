@@ -13,6 +13,7 @@ import urllib.request
 
 import modal
 
+from deploy.backend_state import BackendStateReporter
 from deploy.modal_benchmark import run_concurrency_benchmark
 from deploy.modal_config import (
     COMPILE_CACHE_PATH,
@@ -147,21 +148,6 @@ with sglang_image.imports():
     import sglang  # noqa: F401
 
 
-GATEWAY_COLD_START_ESTIMATE_SECONDS = 120
-GATEWAY_CPU = 0.125
-GATEWAY_SCALEDOWN_SECONDS = 5
-GATEWAY_MAX_INPUTS = 100
-
-gateway_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .uv_pip_install(
-        "fastapi==0.116.1",
-        "httpx==0.28.1",
-    )
-    .add_local_python_source("deploy")
-)
-
-
 def _http_json(url: str, payload: dict, timeout: float = 180) -> dict:
     request = urllib.request.Request(
         url,
@@ -265,6 +251,8 @@ class Qwen38Backend:
     @modal.enter()
     def startup(self):
         startup_started = time.perf_counter()
+        self.state_reporter = BackendStateReporter(CONFIG.served_model_name)
+        self.state_reporter.start()
         _validate_models()
 
         subprocess.run(
@@ -324,9 +312,14 @@ class Qwen38Backend:
             f"total={committed_at - startup_started:.2f}s",
             flush=True,
         )
+        self.state_reporter.mark_ready()
 
     @modal.exit()
     def shutdown(self):
+        reporter = getattr(self, "state_reporter", None)
+        if reporter is not None:
+            reporter.stop("modal_scaledown")
+
         process = getattr(self, "process", None)
         if process is None or process.poll() is not None:
             return
@@ -340,38 +333,6 @@ class Qwen38Backend:
             except ProcessLookupError:
                 pass
             process.wait(timeout=5)
-
-
-@app.function(
-    name="Qwen38Gateway",
-    image=gateway_image,
-    cpu=GATEWAY_CPU,
-    min_containers=0,
-    max_containers=1,
-    scaledown_window=GATEWAY_SCALEDOWN_SECONDS,
-    timeout=HOUR,
-)
-@modal.concurrent(max_inputs=GATEWAY_MAX_INPUTS)
-@modal.asgi_app(label="qwen38server")
-def Qwen38Server():
-    """Scale-to-zero public OpenAI-compatible gateway for the GPU backend."""
-
-    backend_url = Qwen38Backend.get_url()
-    os.environ["QWEN38_BACKEND_URL"] = backend_url
-    os.environ["QWEN38_COLD_START_ESTIMATE_SECONDS"] = str(
-        GATEWAY_COLD_START_ESTIMATE_SECONDS
-    )
-    print(
-        "Starting scale-to-zero cold-start gateway:",
-        f"backend={backend_url}",
-        f"cpu={GATEWAY_CPU}",
-        f"scaledown_window={GATEWAY_SCALEDOWN_SECONDS}s",
-        f"max_inputs={GATEWAY_MAX_INPUTS}",
-        flush=True,
-    )
-    from deploy.gateway import app as gateway_app
-
-    return gateway_app
 
 
 @app.local_entrypoint()
