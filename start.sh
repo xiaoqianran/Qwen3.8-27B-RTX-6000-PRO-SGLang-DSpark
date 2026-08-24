@@ -42,8 +42,10 @@ set -euo pipefail
 #
 # Hardware notes:
 #   - --attention-backend flashinfer required on SM120.
-#   - NVFP4 W4A4 checkpoint (~16.5GB LM / ~21.9GB repo incl. vision + MTP
-#     head); FP8 (~28.5GB) fits fine on 96GB too but is slower + heavier.
+#   - NVFP4 W4A4 checkpoint with dense BF16 lm_head
+#     (RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead; ~23.6 GB repo). Packed-FP4
+#     twin: MODEL_ID=RadixArk/Qwen3.8-27B-NVFP4 (~21.9 GB). FP8 (~28.5 GB)
+#     fits on 96 GB too but is slower + heavier.
 #   - KV cache is FP8 (--kv-cache-dtype fp8_e4m3). SGLang's 4-bit KV paths
 #     are not built for this hybrid-GDN model (flashinfer rejects KV4 for
 #     it, and the triton fp4 decode kernel does not exist in this image),
@@ -51,10 +53,10 @@ set -euo pipefail
 #
 # Memory budget (done for 96GB, DFlash 2 -- no drafter state pool):
 #   budget      = 96 GB x 0.90 (mem-fraction-static) = ~86 GB
-#   weights     = ~25.7 GB (21.9 NVFP4 base + 3.8 DFlash2 BF16 draft)
+#   weights     = ~27.4 GB (23.6 NVFP4 BF16-head base + 3.8 DFlash2 BF16 draft)
 #   graphs/runtime ~3-4 GB (flashinfer workspace, CUDA graphs, mm pools,
 #                 drafter window cache, ..)
-#   KV pool     = 86 - 25.7 - 3.5 = ~57 GB -> ~1.7M tokens at 32.8KB
+#   KV pool     = 86 - 27.4 - 3.5 = ~55 GB -> ~1.7M tokens at 32.8KB
 #   -> context  : --context-length 262144 (full native 256K window). The
 #                 ~1.7M-token pool means 8 concurrent requests can each be
 #                 ~210K, or share prefixes via radix cache; a single
@@ -82,7 +84,7 @@ set -euo pipefail
 #     <tool_call><function=...>/<parameter=...> payload; SGLang needs no
 #     vLLM-style --enable-auto-tool-choice.
 
-MODEL_ID="RadixArk/Qwen3.8-27B-NVFP4"
+MODEL_ID="${MODEL_ID:-RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead}"
 DRAFT_MODEL_ID="z-lab/Qwen3.8-27B-DFlash2"
 SERVED_MODEL_NAME="qwen3.8-27b-6000pro"
 IMAGE="lmsysorg/sglang:qwen38-27b"
