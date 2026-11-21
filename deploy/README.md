@@ -9,7 +9,7 @@ so the Docker and Modal backends do not maintain duplicate compatibility code.
 ```text
 CPU preparation (8 CPU, no GPU)
         │
-        ├── RadixArk/Qwen3.8-27B-NVFP4
+        ├── RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
         └── z-lab/Qwen3.8-27B-DFlash2
         ▼
 qwen38-27b-model-store (persistent Volume)
@@ -60,19 +60,18 @@ It also verifies that the base server exposes `--max-mamba-cache-size` and
 
 ## RTX PRO 6000 profile
 
-The defaults follow the current SGLang RTX PRO 6000 + NVFP4 baseline and the
-configuration that completed real Modal boots with DFlash2:
+The defaults now match the Docker RTX PRO 6000 recipe; the BF16 lm_head and prefill changes still require Modal GPU validation:
 
 ```text
 GPU                          RTX-PRO-6000
 SGLang image                 lmsysorg/sglang:qwen38-27b
-Target                       RadixArk/Qwen3.8-27B-NVFP4
+Target                       RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
 Draft                        z-lab/Qwen3.8-27B-DFlash2
 Attention                    flashinfer
 KV cache                     fp8_e4m3
 Context                      262144
-mem-fraction-static          0.85
-chunked-prefill-size         2048
+mem-fraction-static          0.90
+chunked-prefill-size         4096
 max-prefill-tokens           16384
 Mamba radix strategy         extra_buffer
 Mamba SSM dtype              float32
@@ -92,14 +91,13 @@ are also explicit so this memory assumption cannot drift with a future SGLang
 default. DFlash2's draft model is pure attention, but speculative verification
 still uses target-model recurrent state.
 
-The validated boot auto-sized the shared KV pool to 958,178 tokens. The 262,144
-context setting is a per-request upper bound, not a promise that eight requests
+The previous NVFP4 Modal baseline auto-sized the shared KV pool to 958,178 tokens. The new BF16 lm_head and 0.90 static-memory configuration requires a fresh KV pool measurement. The 262,144 context setting is a per-request upper bound, not a promise that eight requests
 can each keep a full 256K context resident simultaneously. Concurrent requests
 share that KV pool; SGLang remains responsible for scheduling/retraction under
 long-context pressure.
 
 `--min-free-slots-delay` is intentionally not overridden. The RTX PRO 6000
-profile keeps the 2048-token prefill chunk and the observed 16384-token maximum
+profile now matches the Docker recipe: 4096-token prefill chunk and 16384-token maximum
 prefill budget.
 
 ## Cold-start optimization
@@ -112,12 +110,10 @@ resolved target/draft revisions and runtime configuration. The cache persists
 Triton, TorchInductor, SGLang, and FlashInfer autotune artifacts and is explicitly
 committed after warmup.
 
-The default profile remains the validated full CUDA-graph profile. A `fast`
-profile reduces the 42 prefill graph shapes to these 10 buckets while preserving
-the 2048-token chunk ceiling:
+The default profile remains full CUDA-graph capture, but the updated prefill settings require validation. The `fast` profile uses these 11 buckets:
 
 ```text
-4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
+4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
 ```
 
 Prepare the default/full cache without running a long benchmark:

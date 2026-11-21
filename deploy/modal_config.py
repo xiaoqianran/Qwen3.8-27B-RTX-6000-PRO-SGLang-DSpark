@@ -27,7 +27,7 @@ class ServingConfig:
         "lmsysorg/sglang:qwen38-27b",
     )
 
-    model_id: str = "RadixArk/Qwen3.8-27B-NVFP4"
+    model_id: str = "RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead"
     draft_model_id: str = "z-lab/Qwen3.8-27B-DFlash2"
     model_revision: str | None = os.environ.get("QWEN38_MODEL_REVISION") or None
     draft_model_revision: str | None = (
@@ -39,7 +39,7 @@ class ServingConfig:
     compile_cache_volume_name: str = "qwen38-27b-compile-cache"
 
     # Cold-start A/B profile. `full` is the v0.1.0 behavior. `fast` keeps a
-    # sparse power-of-two prefill CUDA-graph set while preserving 2048 coverage.
+    # sparse power-of-two prefill CUDA-graph set while preserving 4096 coverage.
     # Graph profile is intentionally NOT part of the persistent disk-cache key:
     # CUDA graphs are process-local, while Triton/Inductor/FlashInfer artifacts
     # are reusable by both full and fast graph profiles.
@@ -60,6 +60,7 @@ class ServingConfig:
         512,
         1024,
         2048,
+        4096,
     )
 
     # Experimental decode/verify graph A/B. SGLang's decode CUDA-graph runner
@@ -79,12 +80,12 @@ class ServingConfig:
     download_timeout_hours: int = 4
     server_cpu: int = 8
 
-    # Current SGLang RTX PRO 6000 + NVFP4 baseline.
-    mem_fraction_static: float = 0.85
+    # Match the Docker RTX PRO 6000 + NVFP4/BF16-head serving recipe.
+    mem_fraction_static: float = 0.90
     context_length: int = 262_144
     kv_cache_dtype: str = "fp8_e4m3"
     attention_backend: str = "flashinfer"
-    chunked_prefill_size: int = 2048
+    chunked_prefill_size: int = 4096
     max_prefill_tokens: int = 16_384
 
     # Qwen3.8's hybrid-GDN target needs five base recurrent-state slots per

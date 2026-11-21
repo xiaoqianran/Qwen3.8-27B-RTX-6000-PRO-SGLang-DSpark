@@ -158,10 +158,10 @@ uv run modal run deploy/modal_app.py --cache-only
 Captures:
 
 ```text
-4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048
+4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
 ```
 
-instead of the 42-shape baseline:
+for the updated 4096-token chunk ceiling, instead of the earlier 42-shape baseline:
 
 ```powershell
 $env:QWEN38_COLD_START_PROFILE="fast"
