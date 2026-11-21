@@ -8,14 +8,14 @@
 </p>
 
 [![SGLang](https://img.shields.io/badge/SGLang-cookbook-blue)](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)
-[![Model](https://img.shields.io/badge/model-Qwen3.8--27B-informational)](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)
+[![Model](https://img.shields.io/badge/model-Qwen3.8--27B-informational)](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead)
 [![arch](https://img.shields.io/badge/arch-SM120%20%2F%2096GB-lightgrey)](#)
 
-Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA **RTX PRO 6000 (96 GB, SM120 / Blackwell)**. One script starts an OpenAI-compatible server, one stops it.
+Opinionated, ready-to-run scripts to serve **[Qwen3.8-27B](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead)** with **[SGLang](https://docs.sglang.io)** in Docker on an NVIDIA **RTX PRO 6000 (96 GB, SM120 / Blackwell)**. One script starts an OpenAI-compatible server, one stops it.
 
 The serving recipe builds on the **[SGLang cookbook's RTX PRO 6000 cell](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B)** for the model, with the **DFlash 2** speculative-decoding recipe from the drafter card / blog, and the memory budget worked out for 96 GB.
 
-- **NVFP4 W4A4** checkpoint — cookbook: "NVFP4 weights ~16.5 GB (recommended);" bf16 (~54 GB) and FP8 (~28.5 GB) also fit on 96 GB but NVFP4 is the fastest/smallest
+- **NVFP4 W4A4** checkpoint with a dense **BF16 `lm_head`** (default [`…-NVFP4-BF16-LMHead`](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead); packed-FP4 twin via `MODEL_ID=RadixArk/Qwen3.8-27B-NVFP4`). Cookbook: NVFP4 LM ~16.5 GB before the dense head; full BF16 (~54 GB) and FP8 (~28.5 GB) also fit on 96 GB but NVFP4 is the fastest/smallest
 - **Full 256K-token context** — the model's native 262,144 window, no YaRN needed; the ~1.7M-token fp8 KV pool covers it with room to spare
 - **FP8 KV cache** (`fp8_e4m3`, ~32.8 KB/token, checkpoint calibration scales) — SGLang's 4-bit KV paths are not built for this hybrid-GDN model in this image, so FP8 is the best supported precision
 - **DFlash 2 speculative decoding** (trained BF16 drafter `z-lab/Qwen3.8-27B-DFlash2`, block_size=8 = 8 draft tokens/step) — ***not*** the in-checkpoint MTP head and ***not*** DSpark: measured head-to-head on the drafter card, DFlash 2 beat MTP (GSM8K 3.43x vs 2.59x) and DSpark (2.69x) at concurrency 1, and 2.84x vs 2.19x/2.23x at concurrency 8
@@ -37,7 +37,17 @@ The serving recipe builds on the **[SGLang cookbook's RTX PRO 6000 cell](https:/
 | CLI tools | `docker`, `curl` |
 | Hugging Face token | `HF_TOKEN` defined in `~/.bashrc` (picked up automatically; higher rate limits) |
 
-There is no separate download step: the container pulls both checkpoints into `./.cache/huggingface` on first start (~22 GB base + ~3.8 GB DFlash 2 drafter).
+There is no separate download step: the container pulls both checkpoints into `./.cache/huggingface` on first start (~24 GB BF16-head NVFP4 base + ~3.8 GB DFlash 2 drafter).
+
+**Existing clones (git pull):** the default Hub id changed to [`RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead`](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead). Hugging Face caches **per repo**, so the old packed-FP4 tree is **not** reused — the next start downloads ~24 GB into a new folder and leaves ~22 GB unused unless you delete it:
+
+```bash
+./stop.sh
+rm -rf .cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4
+./start.sh
+```
+
+Keep `models--RadixArk--Qwen3.8-27B-NVFP4` only if you still set `MODEL_ID=RadixArk/Qwen3.8-27B-NVFP4`. The DFlash 2 **draft** cache is unchanged.
 
 ## Quick start
 
@@ -154,14 +164,14 @@ For the full lifecycle, autoscaling semantics, heartbeat state, and the deployme
 | Input | Value | Source |
 |---|---|---|
 | Static memory budget | 96 GB × `0.90` = **~86 GB** | this recipe |
-| Weights (NVFP4 base + DFlash 2 BF16 drafter) | **~25.7 GB** = 21.9 + 3.8 | repo blobs / drafter card |
+| Weights (NVFP4 BF16-head base + DFlash 2 BF16 drafter) | **~27.4 GB** = 23.6 + 3.8 | repo blobs / drafter card |
 | DFlash 2 state pool | **none** (pure-attention drafter) | drafter architecture |
 | Graphs / runtime | ~3–4 GB (flashinfer workspace, CUDA graphs, mm pools, drafter window cache) | observed |
 | KV bytes/token (fp8) | **32.8 KB** (16 attn layers × GQA 4 × 256 × K+V) | cookbook |
-| KV pool left | **~57 GB** → **~1.7M tokens** | arithmetic |
+| KV pool left | **~55 GB** → **~1.7M tokens** | arithmetic |
 | Context | **`--context-length 262144`** (full native 256K; no YaRN / override env needed) | model config |
 
-Reference: on the old DSpark recipe the drafter held GDN state (12 slots/req × 8 = 96 slots = ~7.5 GB) and KV was squeezed to ~50 GB; DFlash 2's pure-attention drafter removes that pool, so the whole freed budget goes to KV instead. The ~1.7M-token pool means 8 concurrent requests can each run ~210K tokens, or share prefixes via the radix cache; a single request can use the full 262,144 at once.
+Reference: on the old DSpark recipe the drafter held GDN state (12 slots/req × 8 = 96 slots = ~7.5 GB) and KV was squeezed to ~50 GB; DFlash 2's pure-attention drafter removes that pool, so the whole freed budget goes to KV instead. The extra ~1.7 GB dense `lm_head` vs packed FP4 is small next to that. The ~1.7M-token pool means 8 concurrent requests can each run ~210K tokens, or share prefixes via the radix cache; a single request can use the full 262,144 at once.
 
 **Verify after boot** (in `.sglang.log`): `max_running_requests` = 8, KV-cache token count ≥ ~1.5M, and the DFLASH lines — `"Initialized DFLASH draft runner. ..., model=DFlash2DraftModel, block_size=8, ..."`, `"DFLASH draft greedy head folded into the draft cuda graph"`, and `"DFLASH fused KV materialization enabled."`. To change concurrency, `MAX_CONCURRENT_REQUESTS=8 ./start.sh` etc. (maps 1:1 to `--max-running-requests`; update expectations for max_total_num_tokens accordingly).
 
@@ -181,7 +191,7 @@ Defaults live at the top of `start.sh`:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `MODEL_ID` | `RadixArk/Qwen3.8-27B-NVFP4` | NVFP4 W4A4 (bf16/FP8 also fit on 96 GB — set `MODEL_ID` to `Qwen/Qwen3.8-27B` / `-FP8`, adjust expectations) |
+| `MODEL_ID` | `RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead` | NVFP4 W4A4 + dense BF16 `lm_head` (cookbook-measured export). Packed-FP4: `MODEL_ID=RadixArk/Qwen3.8-27B-NVFP4`. Full bf16/FP8 also fit on 96 GB (`Qwen/Qwen3.8-27B` / `-FP8`). |
 | `DRAFT_MODEL_ID` | `z-lab/Qwen3.8-27B-DFlash2` | Trained BF16 block-diffusion drafter (~3.8 GB, auto-downloads) |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b-6000pro` | Name clients use in API requests |
 | `IMAGE` | `lmsysorg/sglang:qwen38-27b` | Cookbook-pinned image for this model |
@@ -197,7 +207,7 @@ Defaults live at the top of `start.sh`:
 - **DFlash 2 backport overlay:** DFlash 2 (PR #35371, 2026-08-19) is not in the cookbook-pinned image; `start.sh` bind-mounts `patch/sglang` read-only to add `DFlash2DraftModel` + helpers and refuses to launch if any file is missing. See [`patch/sglang/README.md`](patch/sglang/README.md).
 - **`--min-free-slots-delay 1`** — scheduler admits requests promptly (keeps latency low at low concurrency).
 - **`--context-length 262144`** — the model's **native 256K** window (no YaRN / override env needed).
-- **`--kv-cache-dtype fp8_e4m3`** — explicit; the NVFP4 checkpoint declares fp8 KV anyway (`auto` honors its calibration scales). SGLang's 4-bit KV options (`nvfp4`/`fp4_*`) are not wired for hybrid-GDN decode in this image (flashinfer rejects KV4 for it; the triton fp4 kernel doesn't exist), so fp8 is the best supported precision. At 32.8 KB/token the ~57 GB pool yields ~1.7M tokens.
+- **`--kv-cache-dtype fp8_e4m3`** — explicit; the NVFP4 checkpoint declares fp8 KV anyway (`auto` honors its calibration scales). SGLang's 4-bit KV options (`nvfp4`/`fp4_*`) are not wired for hybrid-GDN decode in this image (flashinfer rejects KV4 for it; the triton fp4 kernel doesn't exist), so fp8 is the best supported precision. At 32.8 KB/token the ~55 GB pool yields ~1.7M tokens.
 - **`--mem-fraction-static 0.90`** with `--chunked-prefill-size 4096` (smooth decode on hybrid GDN; 8192 is the DGX-Spark-only exception). No `--disable-prefill-cuda-graph` (that flag is Spark-specific).
 - **Vision:** the model is a native VLM; SGLang serves the vision tower live (image + video input out of the box).
 
@@ -241,7 +251,7 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 - Tail the server log: `tail -f .sglang.log` (or `docker logs -f qwen3.8-27b-sglang-6000pro`)
 - Start script prints the last 200 log lines and exits if the container dies before becoming ready
 - **Spec decode check:** `grep -i "DFLASH" .sglang.log` should show the draft runner initialized (`model=DFlash2DraftModel, block_size=8`), the draft greedy head folded into the draft CUDA graph, and fused KV materialization enabled (draft works). `grep max_total_num_tokens .sglang.log` — expect ≥ ~1.5M
-- First start downloads ~22 GB base + ~3.8 GB drafter; subsequent starts reuse `./.cache/huggingface`
+- First start downloads ~24 GB BF16-head NVFP4 base + ~3.8 GB drafter; subsequent starts reuse `./.cache/huggingface`. After a `git pull` from the packed-FP4 default, **delete** `.cache/huggingface/hub/models--RadixArk--Qwen3.8-27B-NVFP4` or you will keep both trees (~22 GB + ~24 GB).
 - If the box also drives a display, lower `--mem-fraction-static` to ~0.85 so the desktop keeps VRAM headroom
 
 ## Repository layout
@@ -251,7 +261,7 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 ├── start.sh      # launch SGLang container (DFlash 2), wait for readiness
 ├── stop.sh       # stop the container, clean up pid file
 ├── patch/sglang  # DFlash 2 backport overlay for the cookbook image (git-tracked, mount read-only)
-├── .gitignore    # excludes .cache/, logs, pid file
+├── CHANGELOG.md  # notable changes
 └── README.md
 ```
 
@@ -260,6 +270,8 @@ SGLang also serves an **Anthropic-compatible** endpoint at `http://127.0.0.1:888
 - [SGLang cookbook — Qwen3.8-27B](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B) — serving recipe, DSpark/MTP guidance, GDN state-pool calculator
 - [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) — trained DFlash 2 drafter (~3.8 GB, BF16, block-8 serving recipe)
 - [Inco AI — DFlash 2 blog](https://inco.ai/blog/dflash2/) — drafter design, head-to-head numbers vs MTP/DSpark
+- [RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead) — default NVFP4 W4A4 checkpoint, dense BF16 `lm_head` (the export the [SGLang cookbook](https://docs.sglang.io/cookbook/autoregressive/Qwen/Qwen3.8-27B) recipes were measured against)
+- [RadixArk/Qwen3.8-27B-NVFP4](https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4) — same NVFP4 body with `lm_head` packed to FP4
 - [Qwen3.8-27B model card](https://huggingface.co/Qwen/Qwen3.8-27B) — 256K native context, sampling defaults, thinking-mode behavior
 - [SGLang](https://github.com/sgl-project/sglang) — inference engine and OpenAI/Anthropic-compatible server; DFlash 2 upstream PRs #35371 / #35496
 - [MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark](https://github.com/MiaAI-Lab/Qwen3.8-27B-SGLang-DGX-Spark) — the 128 GB sibling recipe (DSpark path; this repo replaces DSpark with DFlash 2)
