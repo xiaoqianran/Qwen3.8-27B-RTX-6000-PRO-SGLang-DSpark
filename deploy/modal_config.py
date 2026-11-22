@@ -6,6 +6,9 @@ import os
 from dataclasses import dataclass
 
 
+UPSTREAM_LORA_IMAGE = "lmsysorg/sglang:nightly-dev-cu13-20260823-eec794bc"
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -16,9 +19,12 @@ def _env_bool(name: str, default: bool = False) -> bool:
 @dataclass(frozen=True)
 class ServingConfig:
     app_name: str = "qwen38-27b-modal"
-    gateway_app_name: str = "qwen38-27b-gateway"
     gpu: str = "RTX-PRO-6000"
     port: int = 8000
+    require_proxy_auth: bool = _env_bool("QWEN38_REQUIRE_PROXY_AUTH")
+    api_key_secret: str | None = os.environ.get("QWEN38_API_KEY_SECRET") or None
+    endpoint_label: str = os.environ.get("QWEN38_ENDPOINT_LABEL", "qwen38-sglang-direct")
+    pi_lora: bool = _env_bool("QWEN38_PI_LORA")
 
     # Match the Qwen3.8 cookbook image. DFlash2 is supplied by the repository's
     # shared patch/sglang backport until a verified official image includes it.
@@ -75,9 +81,6 @@ class ServingConfig:
     # loads the original conditional-generation checkpoint path unchanged.
     language_only: bool = _env_bool("QWEN38_LANGUAGE_ONLY", False)
 
-    download_cpu: int = 8
-    download_max_workers: int = 16
-    download_timeout_hours: int = 4
     server_cpu: int = 8
 
     # Match the Docker RTX PRO 6000 + NVFP4/BF16-head serving recipe.
@@ -108,7 +111,7 @@ class ServingConfig:
         os.environ.get("QWEN38_GPU_SCALEDOWN_SECONDS", "600")
     )
 
-    speculative_algorithm: str = "DFLASH"
+    speculative_algorithm: str = os.environ.get("QWEN38_SPECULATIVE_ALGORITHM", "DFLASH").upper()
     speculative_num_draft_tokens: int = 8
     speculative_draft_quantization: str = "unquant"
     speculative_draft_attention_backend: str = "flashinfer"
@@ -122,6 +125,15 @@ class ServingConfig:
     shutdown_timeout_seconds: int = 20
 
     def __post_init__(self) -> None:
+        if self.speculative_algorithm not in {"DFLASH", "NONE"}:
+            raise ValueError("QWEN38_SPECULATIVE_ALGORITHM must be DFLASH or NONE")
+        if self.pi_lora and self.speculative_algorithm == "DFLASH" and self.sglang_image != UPSTREAM_LORA_IMAGE:
+            raise ValueError(
+                "This SGLang image does not support DFlash2 with dynamic LoRA. "
+                "Set QWEN38_SPECULATIVE_ALGORITHM=NONE when QWEN38_PI_LORA=1."
+            )
+        if self.require_proxy_auth and self.api_key_secret:
+            raise ValueError("Choose either Modal Proxy Auth or a SGLang API key secret")
         if self.cold_start_profile not in {"full", "fast"}:
             raise ValueError(
                 "QWEN38_COLD_START_PROFILE must be either 'full' or 'fast'"
@@ -147,10 +159,14 @@ class ServingConfig:
 CONFIG = ServingConfig()
 
 MODEL_STORE_PATH = "/models"
-TARGET_MODEL_PATH = f"{MODEL_STORE_PATH}/target"
-DRAFT_MODEL_PATH = f"{MODEL_STORE_PATH}/draft"
 
 COMPILE_CACHE_PATH = "/compile-cache"
+PI_LORA_STORE = "/pi-lora-store"
+PI_LORA_PATH = (
+    PI_LORA_STORE + "/models/qwen38-pi/hub/models--harness-hub--Qwen3.8-27B-pi-adapted"
+    "/snapshots/7d42b119e2d4d475fa11270634b1ef98d1cd5aee"
+)
+PI_LORA_NAME = "qwen3.8-27B-pi"
 
 
 def runtime_cache_identity() -> dict[str, object]:
@@ -177,13 +193,17 @@ def runtime_cache_identity() -> dict[str, object]:
         "mamba_radix_cache_strategy": c.mamba_radix_cache_strategy,
         "mamba_ssm_dtype": c.mamba_ssm_dtype,
         "speculative_algorithm": c.speculative_algorithm,
+        **({"pi_lora": PI_LORA_PATH} if c.pi_lora else {}),
         "speculative_num_draft_tokens": c.speculative_num_draft_tokens,
         "speculative_draft_quantization": c.speculative_draft_quantization,
         "speculative_draft_attention_backend": c.speculative_draft_attention_backend,
     }
 
 
-def build_sglang_command(port: int | None = None) -> list[str]:
+def build_sglang_command(
+    *, target_path: str, draft_path: str | None = None,
+    port: int | None = None,
+) -> list[str]:
     c = CONFIG
     listen_port = c.port if port is None else port
 
@@ -192,7 +212,7 @@ def build_sglang_command(port: int | None = None) -> list[str]:
         "-m",
         "sglang.launch_server",
         "--model-path",
-        TARGET_MODEL_PATH,
+        target_path,
         "--served-model-name",
         c.served_model_name,
         "--trust-remote-code",
@@ -216,17 +236,26 @@ def build_sglang_command(port: int | None = None) -> list[str]:
         str(c.chunked_prefill_size),
         "--max-prefill-tokens",
         str(c.max_prefill_tokens),
+    ]
+
+    if c.speculative_algorithm != "NONE":
+        if not draft_path:
+            raise ValueError("Draft model path is required for DFLASH")
+        command.extend([
         "--speculative-algorithm",
         c.speculative_algorithm,
         "--speculative-draft-model-path",
-        DRAFT_MODEL_PATH,
+        draft_path,
         "--speculative-num-draft-tokens",
         str(c.speculative_num_draft_tokens),
         "--speculative-draft-model-quantization",
         c.speculative_draft_quantization,
         "--speculative-draft-attention-backend",
         c.speculative_draft_attention_backend,
-    ]
+        ])
+    if c.pi_lora:
+        command.extend(["--enable-lora", "--lora-paths", f"{PI_LORA_NAME}={PI_LORA_PATH}",
+                        "--max-lora-rank", "32", "--max-loras-per-batch", "2"])
 
     if c.language_only:
         command.append("--language-only")

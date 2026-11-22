@@ -7,40 +7,34 @@ so the Docker and Modal backends do not maintain duplicate compatibility code.
 ## Architecture
 
 ```text
-CPU preparation (8 CPU, no GPU)
+CPU download (2 x 4 CPU writers, no GPU)
         │
         ├── RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead
-        └── z-lab/Qwen3.8-27B-DFlash2
+        └── z-lab/Qwen3.8-27B-DFlash2 (only when DFLASH enabled)
         ▼
 qwen38-27b-model-store (persistent Volume)
         │ read-only
         ▼
-lmsysorg/sglang:qwen38-27b + patch/sglang
-        ▼
-independent scale-to-zero CPU Gateway App (public Modal ASGI Web Function URL)
+max 1 × RTX PRO 6000 (`Qwen38HTTP`) ← OpenAI-compatible client
         │
-        ├── cold GPU: OpenAI-compatible `cold-starting` responses
-        └── ready GPU: transparent HTTP/1.1 proxy
-        ▼
-max 1 × RTX PRO 6000 (`Qwen38Backend`)
-        ▼
-SGLang + DFlash2 + FlashInfer
+        └── lmsysorg/sglang:qwen38-27b + patch/sglang
+                └── SGLang + DFlash2 + FlashInfer
         └── max 8 active requests
 ```
 
 The GPU runtime is offline from Hugging Face and uses only:
 
 ```text
---model-path /models/target
---speculative-draft-model-path /models/draft
+--model-path <published target path under /models>
+--speculative-draft-model-path <published draft path under /models>  # only DFLASH
 HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
 ```
 
-CPU preparation verifies model metadata and all safetensors shards before GPU
-allocation. If model revisions are not pinned, the CPU preparation step is
-re-evaluated on each deploy; `snapshot_download` still reuses the persistent
-Volume and only fetches missing/changed data.
+The downloader uses modal-benchmark 0.1.5 on CPU. Its Reader validates
+persisted files, and an independent publish step writes the effective model
+paths to the Volume only after verification. GPU startup never downloads.
+When speculative decoding is disabled, the DFlash2 draft is not downloaded.
 
 ## SGLang runtime choice
 
@@ -80,7 +74,6 @@ SGLang max running requests  8
 max-mamba-cache-size         40
 Modal target concurrency     8
 Modal max containers         1
-Modal shutdown request grace 300 s
 ```
 
 Qwen3.8 is a hybrid-GDN model. With `extra_buffer` and the overlap scheduler,
@@ -143,49 +136,19 @@ Cold-start timing: engine_ready=... warmup=... cache_commit=... total=...
 Set `QWEN38_RUNTIME_CACHE_EPOCH` to a new value to deliberately invalidate all
 runtime artifacts without deleting older cache namespaces.
 
-## Cold-start gateway
+## Direct HTTP and cold starts
 
-The public `Qwen38Gateway` endpoint is a lightweight Modal ASGI Web Function with
-`cpu=0.125`, `min_containers=0`, `max_containers=1`, a 5-second scaledown window,
-and up to 100 concurrent inputs in its single lightweight container. The gateway
-therefore scales to zero when idle instead of keeping a CPU container resident.
-A request may pay a small CPU-function cold-start delay, but normal idle cost for
-the gateway is zero. The RTX PRO 6000 backend remains independently scale-to-zero
-as `Qwen38Backend`.
+Clients connect to the `Qwen38HTTP` Modal Server URL with `/v1` appended.
+SGLang serves model discovery, chat completions, and streaming directly over
+HTTP/1.1. The model ID is `qwen3.8-27b`.
 
-Changing the gateway from `@app.server` to `@modal.asgi_app()` changes the public
-endpoint from a `modal.direct` Server URL to the Web Function URL emitted by
-`modal deploy` (normally under `modal.run`). The endpoint label is explicitly
-`qwen38server`; update Cherry Studio's base URL once after deploying this version.
+The first request can trigger a GPU cold start. Allow time for the web endpoint to become ready before retrying. Discovery and health checks also reach the GPU Server, so
+continuous polling can wake the GPU or keep it warm.
 
-The gateway uses a strict user-level GPU wake policy:
-
-```text
-GET  /_gateway/health      -> gateway only; NEVER wakes GPU
-GET  /health               -> heartbeat state only; NEVER wakes/extends GPU
-GET  /v1/models            -> state-driven list; NEVER wakes/extends GPU
-POST /v1/chat/completions  -> real user inference; MAY wake/extend GPU
-```
-
-While the GPU is starting, the inference route still returns a valid OpenAI
-completion/SSE with HTTP 200 instead of exposing the expected Modal Server 503.
-A lightweight Modal Dict heartbeat carries `idle`/`starting`/`ready` state, so
-Cherry Studio background discovery traffic does not need to probe SGLang.
-
-The real `qwen3.8-27b` model id is never exposed by the gateway until the GPU
-backend reports `ready` after SGLang health, warmup, and cache commit complete.
-Streaming cold-start replies terminate with the normal OpenAI SSE `[DONE]`
-marker and include an empty usage chunk when the client requests
-`stream_options.include_usage=true`.
-
-The baseline estimate is 120 seconds. The shared runtime state stores the first
-user inference trigger timestamp, so elapsed/remaining time survives CPU Gateway
-scale-to-zero cycles. If a boot exceeds the estimate, the displayed estimate
-expands rather than reporting a false `0s` remaining.
-
-The gateway-to-backend client explicitly disables HTTP/2 and the GPU Modal
-Server uses `h2_enabled=False`, keeping the SGLang/Uvicorn backend leg on
-HTTP/1.1.
+If upgrading from the two-App deployment, deploy the Server, point clients at
+its URL, and verify a real chat request before retiring the old
+`qwen38-27b-gateway` App. The old `qwen38server` Web Function address belongs
+to that App.
 
 The RTX PRO 6000 backend explicitly uses a 600-second idle scaledown window
 (default, overridable with `QWEN38_GPU_SCALEDOWN_SECONDS`). This keeps the GPU
@@ -200,24 +163,23 @@ target is aligned with SGLang at eight concurrent requests; it is not a hard
 request cap. `max_containers=1` guarantees that demand can never allocate a
 second GPU, and excess work can queue instead.
 
-`exit_grace_period=300` gives an in-flight long generation time to finish when a
-Server is being removed. The `@modal.exit` handler then gives SGLang 20 seconds
-to terminate and force-kills its process group only if graceful shutdown stalls.
+The `@modal.exit` handler gives SGLang 20 seconds to terminate and force-kills its process group only if graceful shutdown stalls.
 
 `modal run` is temporary. After its local benchmark returns, Modal tears down the
 temporary Server, so a final SGLang `SIGTERM`/shutdown sequence in remote logs is
 expected. The validated v02 run exited with zero remaining requests and no
-shutdown traceback. `modal deploy` creates the persistent endpoint; it remains
-deployed while still allowing the CPU gateway and GPU backend replicas to scale
-to zero independently.
+shutdown traceback. `modal deploy` registers the persistent Server URL and
+allows its GPU container count to scale to zero.
 
 ## One-time Modal workspace setup
 
-Use Image Builder `2025.06`:
+This project pins Modal SDK `1.6.4` and uses Image Builder `2026.10`.
+The CPU downloader uses Debian with Python 3.12. The GPU image
+continues to use the SGLang registry image and the DFlash2 patch. If a
+workspace uses a different default, select the builder for the current shell:
 
-```bash
-uv run modal workspace settings set image-builder-version 2025.06
-uv run modal workspace settings list
+```powershell
+$env:MODAL_IMAGE_BUILDER_VERSION = "2026.10"
 ```
 
 The image also restores `typing_extensions==4.16.0` as a compatibility guard.
@@ -266,33 +228,57 @@ are not prematurely terminated by the local client. The benchmark reports
 per-request TTFT and decode tok/s plus average user decode speed and aggregate
 end-to-end throughput.
 
-Persistent deployment uses two independent Apps:
+Deploy the Server and look up its URL:
 
 ```bash
-# GPU backend. Deploy only when backend/SGLang code actually changed.
 uv run modal deploy deploy/modal_app.py
-
-# Lightweight public Gateway. Safe to redeploy without rolling the GPU backend.
-uv run modal deploy deploy/modal_gateway.py
+uv run python -c "import modal; print(modal.Cls.from_name('qwen38-27b-modal', 'Qwen38HTTP')().serve.get_web_url())"
 ```
 
 Do **not** routinely redeploy `deploy/modal_app.py` while users are actively
 generating. Modal deployment version changes can roll the Server revision after
-in-flight requests drain. Gateway-only changes belong in `modal_gateway.py`, so
-they do not touch the RTX PRO 6000 lifecycle.
+in-flight requests drain.
 
 Runtime limits are deliberately simple:
 
 ```text
-Public CPU gateway   min 0 / max 1 / 0.125 CPU / 5 s scaledown / 100 inputs
-GPU backend          min 0 / max 1 / target concurrency 8 / 600 s scaledown
+GPU backend          min 0 / max 1 / concurrent inputs 8 / 600 s scaledown
 GPU replicas         0 or 1
 SGLang requests      up to 8 active inside that one GPU
 ```
 
-The local benchmark intentionally targets `Qwen38Backend` directly and retries
-expected 502/503/504 responses while that GPU Server scales from zero. Normal
-external clients should use the public `Qwen38Gateway` ASGI Web Function instead.
-The GPU backend is currently `unauthenticated=True`; the Web Function is public
-by default. Add authentication before exposing a paid production endpoint
-publicly.
+The local benchmark targets the same Server URL as external clients and retries
+expected 502/503/504 health responses while the GPU Server scales from zero.
+Set `QWEN38_REQUIRE_PROXY_AUTH=1` when deploying to require a
+[Modal Proxy Token](https://modal.com/docs/guide/webhook-proxy-auth). An
+OpenAI-compatible client can use `<token-id>.<token-secret>` as its API key.
+For a custom Bearer key, set `QWEN38_API_KEY_SECRET` to the name of a Modal
+Secret containing `SGLANG_HTTP_API_KEY`, and leave `QWEN38_REQUIRE_PROXY_AUTH`
+unset. SGLang checks the key in the GPU container, so requests can trigger
+GPU startup before this check runs.
+
+To serve Pi LoRA, set `QWEN38_PI_LORA=1`. The cookbook image requires
+`QWEN38_SPECULATIVE_ALGORITHM=NONE`. For DFlash2 with dynamic LoRA, use
+`QWEN38_SPECULATIVE_ALGORITHM=DFLASH` and
+`QWEN38_SGLANG_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20260823-eec794bc`.
+This image uses its native DFlash2 worker and skips the cookbook overlay.
+The adapter is mounted read-only. Select `qwen3.8-27b:qwen3.8-27B-pi`
+in API requests. On RTX PRO 6000 with builder 2026.10 this combination passed
+chat, SSE, a 130,029-token prompt and a Pi CLI file-read tool round trip.
+
+## 使用 modal-benchmark 0.1.5 下载权重
+
+新下载流程独立于 Modal GPU 服务；不再在 Image 构建时执行单 CPU 容器 `snapshot_download()`。下载器使用两个直接 Writer、Xet 校验、提前启动独立 Reader、保留现有 Volume 版本，并以固定 Hugging Face Revision 组织下载目录。只有独立 Reader 返回 VERIFIED 后才发布 `/models/.modal-model-manifest.json`，GPU 启动按清单读取实际目录，不复制权重。
+
+```powershell
+# 离线预览（不启动云端 CPU/GPU）
+uv run python -m deploy.download_models
+
+# 首次准备或补齐目标模型；启用 DFLASH 时同时下载 Draft；可选 --workers 1..5
+uv run python -m deploy.download_models --execute --workers 2
+
+# 下载成功后再部署；部署与 GPU 冷启动均不触发下载
+uv run modal deploy deploy/modal_app.py
+```
+
+默认 Volume：`qwen38-27b-model-store`。下载器需要 Modal 认证和包含 `HF_TOKEN` 的 `huggingface-secret` Secret；它会产生 CPU、网络和存储费用。现有 Volume 的旧权重不会被删除，但没有 v2 发布清单的旧缓存不能直接启动 GPU。Pi LoRA 仍挂载旧 `modal-vllm-sglang` Volume，本次暂未改变适配器下载路径。`modal-benchmark` 依赖固定于 Git commit `b3d1a82bece5118257602aa3d9680ba30acbc7e0`。

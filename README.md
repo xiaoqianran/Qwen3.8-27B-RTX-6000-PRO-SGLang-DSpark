@@ -77,66 +77,25 @@ Runtime artifacts: `.sglang.log` (server log), `.sglang.pid` (container ID), `.c
 
 ## Modal deployment
 
-The Modal deployment is split into **two independent Apps** on purpose. This is important: deploying the CPU Gateway must **not** roll or restart an RTX PRO 6000 backend that is currently serving users.
+Deploy one Modal App, `qwen38-27b-modal`. Cherry Studio or any OpenAI-compatible client calls the `Qwen38HTTP` Server directly. CPU model preparation populates the weight Volume before GPU startup.
 
 ```text
-qwen38-27b-gateway
-└── Qwen38Gateway
-    0.125 CPU, min_containers=0
-    public OpenAI-compatible endpoint
-
-qwen38-27b-modal
-└── Qwen38Backend
-    RTX PRO 6000, min_containers=0, max_containers=1
-    SGLang + DFlash2
+OpenAI-compatible client → Qwen38HTTP (RTX PRO 6000) → SGLang + DFlash2
 ```
-
-### Deploy commands
-
-**First-time / full deployment:**
 
 ```bash
-# 1. Deploy GPU backend
+uv run python -m deploy.download_models --execute --workers 2
 uv run modal deploy deploy/modal_app.py
-
-# 2. Deploy lightweight public Gateway
-uv run modal deploy deploy/modal_gateway.py
+uv run python -c "import modal; print(modal.Cls.from_name('qwen38-27b-modal', 'Qwen38HTTP')().serve.get_web_url())"
 ```
 
-The public Gateway is the endpoint used by Cherry Studio. The current endpoint label is `qwen38server`, for example:
-
-```text
-https://qiaojiajiner--qwen38server.modal.run
-```
-
-Use this as the OpenAI-compatible **Base URL**. The model name is:
+Use the Server URL with `/v1` appended as the OpenAI-compatible **Base URL**. The model name is:
 
 ```text
 qwen3.8-27b
 ```
 
-### Which file should I deploy?
-
-| What changed | Deploy | Does it roll RTX PRO 6000? |
-|---|---|---:|
-| Gateway / Cherry Studio / cold-start message / `/health` / `/v1/models` | `deploy/modal_gateway.py` | **No** |
-| SGLang / DFlash2 / model / GPU parameters / backend lifecycle | `deploy/modal_app.py` | **Yes, potentially** |
-
-For normal Gateway maintenance, run only:
-
-```bash
-uv run modal deploy deploy/modal_gateway.py
-```
-
-**Do not routinely run `uv run modal deploy deploy/modal_app.py` while users are actively generating.** A Backend App deployment creates a new Server revision; an active GPU revision may be replaced after in-flight work drains, and the replacement needs to cold-start again.
-
-This separation was introduced after a real incident: a Gateway-only deployment caused the GPU backend revision to roll, and a later request hit a freshly cold-starting RTX PRO 6000 even though the previous conversation was still active. The Gateway/Backend split prevents Gateway changes from causing that class of restart.
-
-### Cost-saving behavior
-
-The Gateway uses `0.125` CPU, `min_containers=0`, and a short `5s` scaledown window. It is intentionally allowed to disappear completely when idle.
-
-The GPU Backend uses:
+The Server scales to zero with the following defaults:
 
 ```text
 min_containers=0
@@ -144,18 +103,7 @@ max_containers=1
 scaledown_window=600s
 ```
 
-Only a real user inference request is allowed to wake the sleeping GPU:
-
-```text
-GET  /_gateway/health      -> never wakes GPU
-GET  /health               -> never wakes/extends GPU
-GET  /v1/models            -> never wakes/extends GPU
-POST /v1/chat/completions  -> may wake/extend GPU
-```
-
-While the GPU is cold-starting, the Gateway returns an OpenAI-compatible HTTP 200 response using the synthetic `cold-starting` model instead of exposing Modal's 503. Once the backend is ready, `/v1/models` returns the real `qwen3.8-27b` model.
-
-For the full lifecycle, autoscaling semantics, heartbeat state, and the deployment incident timeline, see [`deploy/README.md`](deploy/README.md) and [`deploy/AUTOSCALING.md`](deploy/AUTOSCALING.md).
+The first request wakes the GPU and may wait for the Modal web endpoint to become ready. Requests to `/health` and `/v1/models` can also wake the GPU, so avoid periodic discovery requests if you want it to scale down. See [`deploy/README.md`](deploy/README.md) for cutover steps and [`deploy/AUTOSCALING.md`](deploy/AUTOSCALING.md) for lifecycle details.
 
 ---
 

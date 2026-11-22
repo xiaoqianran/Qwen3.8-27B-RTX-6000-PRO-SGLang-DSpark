@@ -10,21 +10,22 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import modal
 
-from deploy.backend_state import BackendStateReporter
 from deploy.modal_benchmark import run_concurrency_benchmark
 from deploy.modal_config import (
     COMPILE_CACHE_PATH,
     CONFIG,
-    DRAFT_MODEL_PATH,
+    UPSTREAM_LORA_IMAGE,
     MODEL_STORE_PATH,
-    TARGET_MODEL_PATH,
+    PI_LORA_PATH,
+    PI_LORA_STORE,
     build_sglang_command,
     runtime_cache_identity,
 )
-from deploy.model_prepare import download_models, validate_model_store
+from deploy.download_models import validate_model_store
 from deploy.runtime_cache import flashinfer_entry_count, prepare_runtime_cache
 
 MINUTE = 60
@@ -37,46 +38,19 @@ compile_cache = modal.Volume.from_name(
     CONFIG.compile_cache_volume_name, create_if_missing=True
 )
 
-prepare_image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .uv_pip_install("huggingface_hub[hf_xet]==1.26.0")
-    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
-    .run_function(
-        download_models,
-        volumes={MODEL_STORE_PATH: model_store},
-        kwargs={
-            "target_repo": CONFIG.model_id,
-            "target_revision": CONFIG.model_revision,
-            "target_dir": TARGET_MODEL_PATH,
-            "draft_repo": CONFIG.draft_model_id,
-            "draft_revision": CONFIG.draft_model_revision,
-            "draft_dir": DRAFT_MODEL_PATH,
-            "model_store_dir": MODEL_STORE_PATH,
-            "max_workers": CONFIG.download_max_workers,
-        },
-        cpu=CONFIG.download_cpu,
-        timeout=CONFIG.download_timeout_hours * HOUR,
-        force_build=(
-            CONFIG.model_revision is None
-            or CONFIG.draft_model_revision is None
-        ),
-    )
-    .add_local_python_source("deploy")
-)
-
-
-def _validate_models() -> None:
-    validate_model_store(
-        MODEL_STORE_PATH,
-        TARGET_MODEL_PATH,
-        DRAFT_MODEL_PATH,
-        CONFIG.model_id,
-        CONFIG.draft_model_id,
+# Model weights are prepared explicitly by deploy.download_models.
+# Deployment and GPU startup are read-only: never launch downloads here.
+def _validate_models() -> dict[str, str]:
+    return validate_model_store(
+        MODEL_STORE_PATH, CONFIG.model_id, CONFIG.draft_model_id,
+        target_revision=CONFIG.model_revision,
+        draft_revision=CONFIG.draft_model_revision,
+        require_draft=CONFIG.speculative_algorithm != "NONE",
     )
 
 
 @app.function(
-    image=prepare_image,
+    image=modal.Image.debian_slim(python_version="3.12").add_local_python_source("deploy"),
     volumes={MODEL_STORE_PATH: model_store_ro},
     cpu=1,
     timeout=60,
@@ -99,18 +73,22 @@ sglang_image = (
     modal.Image.from_registry(CONFIG.sglang_image)
     .entrypoint([])
     .uv_pip_install("typing_extensions==4.16.0")
-    .add_local_dir(
+)
+if CONFIG.sglang_image != UPSTREAM_LORA_IMAGE:
+    sglang_image = sglang_image.add_local_dir(
         "patch/sglang",
         "/tmp/sglang-patch",
         copy=True,
         ignore=["README.md"],
-    )
-    .run_commands(
+    ).run_commands(
         "cp -a /tmp/sglang-patch/kernels/. "
         "/sgl-workspace/sglang/python/sglang/kernels/ && "
         "cp -a /tmp/sglang-patch/srt/. "
         "/sgl-workspace/sglang/python/sglang/srt/ && "
         "rm -rf /tmp/sglang-patch",
+    )
+sglang_image = (
+    sglang_image.run_commands(
         "python3 -c \""
         "from sglang.kernels.ops.speculative.fused_kv_materialize import FusedKVMaterializeHelper; "
         "from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method; "
@@ -137,6 +115,10 @@ sglang_image = (
             "QWEN38_LANGUAGE_ONLY": "1" if CONFIG.language_only else "0",
             "QWEN38_RUNTIME_CACHE_EPOCH": CONFIG.runtime_cache_epoch,
             "QWEN38_SGLANG_IMAGE": CONFIG.sglang_image,
+            "QWEN38_API_KEY_SECRET": CONFIG.api_key_secret or "",
+            "QWEN38_ENDPOINT_LABEL": CONFIG.endpoint_label,
+            "QWEN38_PI_LORA": "1" if CONFIG.pi_lora else "0",
+            "QWEN38_SPECULATIVE_ALGORITHM": CONFIG.speculative_algorithm,
         }
     )
     .add_local_python_source("deploy")
@@ -148,11 +130,16 @@ with sglang_image.imports():
     import sglang  # noqa: F401
 
 
+def _local_auth_headers() -> dict[str, str]:
+    key = os.environ.get("SGLANG_HTTP_API_KEY")
+    return {"Authorization": "Bearer " + key} if key else {}
+
+
 def _http_json(url: str, payload: dict, timeout: float = 180) -> dict:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_local_auth_headers()},
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -168,7 +155,8 @@ def _wait_ready(process: subprocess.Popen) -> float:
         if process.poll() is not None:
             raise RuntimeError(f"SGLang exited during startup: {process.returncode}")
         try:
-            with urllib.request.urlopen(health_url, timeout=2):
+            request = urllib.request.Request(health_url, headers=_local_auth_headers())
+            with urllib.request.urlopen(request, timeout=2):
                 return time.monotonic() - started
         except Exception:
             time.sleep(2)
@@ -229,31 +217,32 @@ def _parse_concurrency_levels(spec: str) -> list[int]:
     return levels
 
 
-@app.server(
+@app.cls(
     image=sglang_image,
     gpu=CONFIG.gpu,
     cpu=CONFIG.server_cpu,
-    port=CONFIG.port,
     volumes={
         MODEL_STORE_PATH: model_store_ro,
         COMPILE_CACHE_PATH: compile_cache,
+        **({PI_LORA_STORE: modal.Volume.from_name("modal-vllm-sglang").with_mount_options(read_only=True)}
+           if CONFIG.pi_lora else {}),
     },
     startup_timeout=CONFIG.startup_timeout_minutes * MINUTE,
-    target_concurrency=CONFIG.max_running_requests,
     min_containers=0,
     max_containers=CONFIG.modal_max_containers,
     scaledown_window=CONFIG.gpu_scaledown_window_seconds,
-    exit_grace_period=CONFIG.exit_grace_period_seconds,
-    unauthenticated=True,
-    h2_enabled=False,
+    timeout=HOUR,
+    secrets=[modal.Secret.from_name(CONFIG.api_key_secret, required_keys=["SGLANG_HTTP_API_KEY"])]
+    if CONFIG.api_key_secret else [],
 )
-class Qwen38Backend:
+@modal.concurrent(max_inputs=CONFIG.max_running_requests)
+class Qwen38HTTP:
     @modal.enter()
     def startup(self):
         startup_started = time.perf_counter()
-        self.state_reporter = BackendStateReporter(CONFIG.served_model_name)
-        self.state_reporter.start()
-        _validate_models()
+        model_paths = _validate_models()
+        if CONFIG.pi_lora and not (Path(PI_LORA_PATH) / "adapter_config.json").is_file():
+            raise RuntimeError("Pi LoRA snapshot missing from its read-only Volume")
 
         subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
@@ -275,8 +264,21 @@ class Qwen38Backend:
             flush=True,
         )
 
-        command = build_sglang_command()
+        command = build_sglang_command(
+            target_path=model_paths["target"], draft_path=model_paths.get("draft"),
+        )
         process_env = os.environ.copy()
+        if CONFIG.pi_lora:
+            # The fused activation/quantizer bypasses the LoRA wrapper's BF16 input.
+            process_env["SGLANG_DISABLE_SILU_FP4_QUANT_FUSION"] = "1"
+        if CONFIG.api_key_secret:
+            if not process_env.get("SGLANG_HTTP_API_KEY"):
+                raise RuntimeError("SGLANG_HTTP_API_KEY must be set in the Modal Secret")
+            command[2] = "deploy.sglang_auth"
+            command.append("--skip-server-warmup")
+            process_env["PYTHONPATH"] = os.pathsep.join(filter(None, (
+                str(Path(__file__).resolve().parent.parent), process_env.get("PYTHONPATH"),
+            )))
         process_env.update(self.runtime_cache.env)
         # The base image currently carries a deprecated compatibility variable;
         # it is not required by this deployment and only produces warning noise.
@@ -312,14 +314,18 @@ class Qwen38Backend:
             f"total={committed_at - startup_started:.2f}s",
             flush=True,
         )
-        self.state_reporter.mark_ready()
+
+    @modal.web_server(
+        port=CONFIG.port,
+        startup_timeout=CONFIG.startup_timeout_minutes * MINUTE,
+        label=CONFIG.endpoint_label,
+        requires_proxy_auth=CONFIG.require_proxy_auth,
+    )
+    def serve(self):
+        pass
 
     @modal.exit()
     def shutdown(self):
-        reporter = getattr(self, "state_reporter", None)
-        if reporter is not None:
-            reporter.stop("modal_scaledown")
-
         process = getattr(self, "process", None)
         if process is None or process.poll() is not None:
             return
@@ -346,7 +352,7 @@ async def main(
     levels = _parse_concurrency_levels(concurrency)
 
     await model_store_ready.remote.aio()
-    url = await Qwen38Backend.get_url.aio()
+    url = await Qwen38HTTP().serve.get_web_url.aio()
     await asyncio.to_thread(_wait_for_public_server, url)
 
     if cache_only:

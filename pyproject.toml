@@ -2,9 +2,8 @@
 name = "qwen38-modal-deploy"
 version = "0.1.0"
 description = "Modal deployment tooling for Qwen3.8-27B on SGLang"
-requires-python = ">=3.10,<3.15"
+requires-python = ">=3.11,<3.15"
 dependencies = [
-    "modal[api-proxy-support]==1.5.3",
-    "fastapi==0.116.1",
-    "httpx==0.28.1",
+    "modal[api-proxy-support]==1.6.4",
+    "modal-benchmark @ git+https://github.com/xiaoqianran/modal-benchmark.git@b3d1a82bece5118257602aa3d9680ba30acbc7e0",
 ]
