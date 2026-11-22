@@ -460,8 +460,8 @@ api-proxy-support = [
 
 [[package]]
 name = "modal-benchmark"
-version = "0.1.5"
-source = { git = "https://github.com/xiaoqianran/modal-benchmark.git?rev=b3d1a82bece5118257602aa3d9680ba30acbc7e0#b3d1a82bece5118257602aa3d9680ba30acbc7e0" }
+version = "0.2.0"
+source = { git = "https://github.com/xiaoqianran/modal-benchmark.git?rev=60c3e31f5812c98c2cd51618bdfcaed061616bdf#60c3e31f5812c98c2cd51618bdfcaed061616bdf" }
 dependencies = [
     { name = "modal", extra = ["api-proxy-support"] },
 ]
@@ -720,7 +720,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "modal", extras = ["api-proxy-support"], specifier = "==1.6.4" },
-    { name = "modal-benchmark", git = "https://github.com/xiaoqianran/modal-benchmark.git?rev=b3d1a82bece5118257602aa3d9680ba30acbc7e0" },
+    { name = "modal-benchmark", git = "https://github.com/xiaoqianran/modal-benchmark.git?rev=60c3e31f5812c98c2cd51618bdfcaed061616bdf" },
 ]
 
 [[package]]

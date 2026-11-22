@@ -1,15 +1,9 @@
-"""Download Qwen3.8 target and DFlash2 draft using modal-benchmark.
-
-Usage: uv run python -m deploy.download_models --execute
-No GPU is allocated by this module.
-"""
+"""Prepare Qwen3.8 + optional DFlash2 in one Coordinator call (CPU only)."""
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 from deploy.modal_config import CONFIG
 
@@ -18,48 +12,12 @@ MANIFEST = ".modal-model-manifest.json"
 
 
 def sources() -> list[dict[str, str]]:
-    result = [{"repo_id": CONFIG.model_id, "revision": CONFIG.model_revision or "main"}]
+    models = [{"repo_id": CONFIG.model_id,
+               "revision": CONFIG.model_revision or "main"}]
     if CONFIG.speculative_algorithm != "NONE":
-        result.append({"repo_id": CONFIG.draft_model_id,
+        models.append({"repo_id": CONFIG.draft_model_id,
                        "revision": CONFIG.draft_model_revision or "main"})
-    return result
-
-
-def published_record(manifest: dict, base: str, root: str = MOUNT) -> dict:
-    """Translate benchmark paths to relative paths in the mounted Volume."""
-    models = {entry["repo_id"]: entry for entry in manifest["models"]}
-    if len(models) != len(manifest["models"]):
-        raise ValueError("Duplicate repository in download manifest")
-    result = {"version": 2, "downloader": "modal-benchmark-0.1.5"}
-    # Publish what the verified immutable manifest actually contains; the
-    # publisher's remote environment need not match the local CLI environment.
-    roles = [("target", CONFIG.model_id)]
-    if CONFIG.draft_model_id in models:
-        roles.append(("draft", CONFIG.draft_model_id))
-    for role, repo_id in roles:
-        entry = models[repo_id]
-        revision = entry["revision"]
-        location = PurePosixPath(base) / repo_id / revision / "model"
-        if not location.is_relative_to(PurePosixPath(root)):
-            raise ValueError("Model path outside mounted Volume")
-        result[role] = {
-            "repo_id": repo_id,
-            "revision": revision,
-            "path": location.relative_to(PurePosixPath(root)).as_posix(),
-        }
-    return result
-
-
-def check_completion_receipt(manifest: dict, record: dict, root: Path) -> None:
-    """Validate benchmark completion at revision root, outside its model/ dir."""
-    folder = root / record["target"]["path"]
-    marker = folder.parent / "all-components-complete.json"
-    if not marker.is_file():
-        raise RuntimeError(f"Benchmark completion marker missing: {marker}")
-    receipt = json.loads(marker.read_text(encoding="utf-8"))
-    expected = {"status": "COMPLETE", "manifest": manifest, "verification_mode": "xet"}
-    if receipt != expected:
-        raise RuntimeError("Benchmark completion receipt does not match verified manifest")
+    return models
 
 
 def _model_path(root: Path, entry: dict, expected_repo: str, expected_revision: str | None) -> Path:
@@ -119,71 +77,39 @@ def validate_model_store(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--execute", action="store_true", help="Run real CPU download")
+    parser.add_argument("--execute", action="store_true", help="Execute real Modal CPU download")
     parser.add_argument("--workers", type=int, choices=range(1, 6), default=2)
     args = parser.parse_args(argv)
-    plan = {
-        "sources": sources(), "volume_name": CONFIG.model_volume_name,
-        "workers": args.workers, "verification_mode": "xet", "volume_version": "existing",
-    }
-    print("PLAN " + json.dumps(plan, ensure_ascii=False), flush=True)
+
+    models = sources()
+    aliases = {"target": CONFIG.model_id}
+    if CONFIG.speculative_algorithm != "NONE":
+        aliases["draft"] = CONFIG.draft_model_id
+    print("PLAN " + json.dumps({
+        "models": models, "roles": aliases,
+        "volume": CONFIG.model_volume_name,
+        "workers": args.workers, "verification": "xet",
+        "execute": args.execute,
+    }, ensure_ascii=False), flush=True)
     if not args.execute:
         return
 
-    import modal
+    # No extra publish function: Coordinator verifies files and atomically
+    # writes the same v2 manifest consumed by validate_model_store().
     from modal_benchmark.hf import create_downloader
     downloader = create_downloader(
-        volume_name=CONFIG.model_volume_name,
-        volume_version=None,  # retain the existing Volume version
-        mount_path=MOUNT,
-        max_workers=args.workers,
+        volume_name=CONFIG.model_volume_name, volume_version=None,
+        mount_path=MOUNT, max_workers=args.workers,
         verification_mode="xet",
-        region=None,
     )
-    app = downloader.app
-    volume = downloader.volume
-
-    @app.function(
-        image=modal.Image.debian_slim(python_version="3.12").add_local_python_source("deploy"),
-        serialized=True,
-        volumes={MOUNT: volume},
-        cpu=1,
-        timeout=300,
-    )
-    def publish(manifest: dict, base: str) -> dict:
-        volume.reload()
-        record = published_record(manifest, base)
-        root = Path(MOUNT)
-        for role in ("target", "draft"):
-            if role not in record:
-                continue
-            model = root / record[role]["path"]
-            if not (model / "config.json").is_file():
-                raise RuntimeError(f"{role} config.json is missing: {model}")
-            if not any(model.rglob("*.safetensors")):
-                raise RuntimeError(f"{role} weights are missing: {model}")
-        # Reader has verified all models before publication; verify its completion
-        # receipt still exists in the newly reloaded Volume.
-        check_completion_receipt(manifest, record, root)
-        dest = root / MANIFEST
-        temporary = dest.with_name(f"{MANIFEST}.{os.getpid()}.tmp")
-        try:
-            temporary.write_text(json.dumps(record, indent=2), encoding="utf-8")
-            os.replace(temporary, dest)
-            volume.commit()
-        finally:
-            temporary.unlink(missing_ok=True)
-        return record
-
-    with app.run():
-        manifest = downloader.discover_many(sources())
-        identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:24]
-        base = f"{MOUNT}/downloads/full/{identity}"
-        outcome = downloader.run_manifest(manifest, base, workers=str(args.workers))
-        if outcome.get("status") != "VERIFIED":
-            raise RuntimeError("Download did not complete verification")
-        record = publish.remote(manifest, base)
-        print("PUBLISHED " + json.dumps(record, ensure_ascii=False), flush=True)
+    result = downloader.download(
+        models, workers=args.workers, active_manifest=MANIFEST, aliases=aliases)
+    if result.get("status") != "VERIFIED":
+        raise RuntimeError("Qwen3.8 model preparation was not verified")
+    print("PUBLISHED " + json.dumps({
+        "models": result["models"], "timings": result["timings"],
+        "seconds": result["end_to_end_seconds"],
+    }, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

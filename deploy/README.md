@@ -266,9 +266,9 @@ The adapter is mounted read-only. Select `qwen3.8-27b:qwen3.8-27B-pi`
 in API requests. On RTX PRO 6000 with builder 2026.10 this combination passed
 chat, SSE, a 130,029-token prompt and a Pi CLI file-read tool round trip.
 
-## 使用 modal-benchmark 0.1.5 下载权重
+## 使用 modal-benchmark 0.2.0 下载权重
 
-新下载流程独立于 Modal GPU 服务；不再在 Image 构建时执行单 CPU 容器 `snapshot_download()`。下载器使用两个直接 Writer、Xet 校验、提前启动独立 Reader、保留现有 Volume 版本，并以固定 Hugging Face Revision 组织下载目录。只有独立 Reader 返回 VERIFIED 后才发布 `/models/.modal-model-manifest.json`，GPU 启动按清单读取实际目录，不复制权重。
+新流程完全独立于 GPU：一个 Coordinator、两个直接 Writer，不再有额外的 Discover/Inspect/Reader/Report/Publish 容器或远程队列。Writer 使用 Xet 下载和分批 Commit；Coordinator 刷新并检查 Volume，完成后一次性发布 `/models/.modal-model-manifest.json`。GPU 只读取清单，不复制权重。
 
 ```powershell
 # 离线预览（不启动云端 CPU/GPU）
@@ -281,4 +281,4 @@ uv run python -m deploy.download_models --execute --workers 2
 uv run modal deploy deploy/modal_app.py
 ```
 
-默认 Volume：`qwen38-27b-model-store`。下载器需要 Modal 认证和包含 `HF_TOKEN` 的 `huggingface-secret` Secret；它会产生 CPU、网络和存储费用。现有 Volume 的旧权重不会被删除，但没有 v2 发布清单的旧缓存不能直接启动 GPU。Pi LoRA 仍挂载旧 `modal-vllm-sglang` Volume，本次暂未改变适配器下载路径。`modal-benchmark` 依赖固定于 Git commit `b3d1a82bece5118257602aa3d9680ba30acbc7e0`。
+默认 Volume：`qwen38-27b-model-store`。下载器需要 Modal 认证和包含 `HF_TOKEN` 的 `huggingface-secret` Secret；它会产生 CPU、网络和存储费用。现有 Volume 的旧权重不会被删除，但没有 v2 发布清单的旧缓存不能直接启动 GPU。Pi LoRA 仍挂载旧 `modal-vllm-sglang` Volume，本次暂未改变适配器下载路径。`modal-benchmark` 依赖固定于 v0.2.0 Git commit `60c3e31f5812c98c2cd51618bdfcaed061616bdf`。
