@@ -9,7 +9,8 @@ from unittest.mock import Mock, patch
 import unittest
 
 from deploy.download_models import MANIFEST, main, sources, validate_model_store
-from deploy.modal_config import CONFIG, build_sglang_command
+from deploy.modal_config import CONFIG, UPSTREAM_LORA_IMAGE, build_sglang_command
+from deploy import modal_app
 
 
 class ModelDownloadTests(unittest.TestCase):
@@ -77,6 +78,31 @@ class ModelDownloadTests(unittest.TestCase):
         self.save({"target": self.record["target"]})
         with self.assertRaisesRegex(RuntimeError, "v2 download manifest"):
             self.read()
+
+    def test_reject_shard_index_directory_traversal(self):
+        folder = self.root / self.record["target"]["path"]
+        index = folder / "weights.safetensors.index.json"
+        index.write_text(json.dumps({"weight_map": {"layer": "../outside.safetensors"}}))
+        (folder.parent / "outside.safetensors").write_bytes(b"fake")
+        with self.assertRaisesRegex(RuntimeError, "unsafe indexed model shard"):
+            self.read()
+
+    def test_pi_lora_preflight_missing_config_and_weights(self):
+        with TemporaryDirectory() as temp:
+            folder = Path(temp)
+            with (patch.object(modal_app, "PI_LORA_PATH", str(folder)),
+                  patch.object(modal_app, "CONFIG", replace(CONFIG, pi_lora=True, sglang_image=UPSTREAM_LORA_IMAGE))):
+                with self.assertRaisesRegex(RuntimeError, "adapter_config.json"):
+                    modal_app._validate_pi_lora()
+                (folder / "adapter_config.json").write_text("{}", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "weights"):
+                    modal_app._validate_pi_lora()
+                (folder / "adapter_model.safetensors").write_bytes(b"mock")
+                modal_app._validate_pi_lora()
+
+    def test_pi_lora_disabled_skips_adapters(self):
+        with patch.object(modal_app, "CONFIG", replace(CONFIG, pi_lora=False)):
+            modal_app._validate_pi_lora()
 
     def test_single_download_call_publishes_both_roles(self):
         backend = Mock()

@@ -22,6 +22,7 @@ from deploy.modal_config import (
     MODEL_STORE_PATH,
     PI_LORA_PATH,
     PI_LORA_STORE,
+    PI_LORA_VOLUME_NAME,
     build_sglang_command,
     runtime_cache_identity,
 )
@@ -34,6 +35,10 @@ HOUR = 60 * MINUTE
 app = modal.App(CONFIG.app_name, include_source=True)
 model_store = modal.Volume.from_name(CONFIG.model_volume_name, create_if_missing=True)
 model_store_ro = model_store.with_mount_options(read_only=True)
+pi_lora_mounts = (
+    {PI_LORA_STORE: modal.Volume.from_name(PI_LORA_VOLUME_NAME).with_mount_options(read_only=True)}
+    if CONFIG.pi_lora else {}
+)
 compile_cache = modal.Volume.from_name(
     CONFIG.compile_cache_volume_name, create_if_missing=True
 )
@@ -49,14 +54,26 @@ def _validate_models() -> dict[str, str]:
     )
 
 
+def _validate_pi_lora() -> None:
+    """Validate the optional adapter before allocating a paid GPU."""
+    if not CONFIG.pi_lora:
+        return
+    folder = Path(PI_LORA_PATH)
+    if not (folder / "adapter_config.json").is_file():
+        raise RuntimeError(f"Pi LoRA adapter_config.json is missing: {folder}")
+    if not (list(folder.glob("*.safetensors")) or list(folder.glob("adapter_model.bin"))):
+        raise RuntimeError(f"Pi LoRA adapter weights are missing: {folder}")
+
+
 @app.function(
     image=modal.Image.debian_slim(python_version="3.12").add_local_python_source("deploy"),
-    volumes={MODEL_STORE_PATH: model_store_ro},
+    volumes={MODEL_STORE_PATH: model_store_ro, **pi_lora_mounts},
     cpu=1,
     timeout=60,
 )
 def model_store_ready() -> bool:
     _validate_models()
+    _validate_pi_lora()
     return True
 
 
@@ -224,8 +241,7 @@ def _parse_concurrency_levels(spec: str) -> list[int]:
     volumes={
         MODEL_STORE_PATH: model_store_ro,
         COMPILE_CACHE_PATH: compile_cache,
-        **({PI_LORA_STORE: modal.Volume.from_name("modal-vllm-sglang").with_mount_options(read_only=True)}
-           if CONFIG.pi_lora else {}),
+        **pi_lora_mounts,
     },
     startup_timeout=CONFIG.startup_timeout_minutes * MINUTE,
     min_containers=0,
@@ -241,8 +257,7 @@ class Qwen38HTTP:
     def startup(self):
         startup_started = time.perf_counter()
         model_paths = _validate_models()
-        if CONFIG.pi_lora and not (Path(PI_LORA_PATH) / "adapter_config.json").is_file():
-            raise RuntimeError("Pi LoRA snapshot missing from its read-only Volume")
+        _validate_pi_lora()
 
         subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],

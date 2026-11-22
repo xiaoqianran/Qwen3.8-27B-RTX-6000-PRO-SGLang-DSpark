@@ -130,7 +130,8 @@ class ServingConfig:
         if self.pi_lora and self.speculative_algorithm == "DFLASH" and self.sglang_image != UPSTREAM_LORA_IMAGE:
             raise ValueError(
                 "This SGLang image does not support DFlash2 with dynamic LoRA. "
-                "Set QWEN38_SPECULATIVE_ALGORITHM=NONE when QWEN38_PI_LORA=1."
+                "Set QWEN38_SGLANG_IMAGE to the validated upstream LoRA image, "
+                "or disable speculative decoding."
             )
         if self.require_proxy_auth and self.api_key_secret:
             raise ValueError("Choose either Modal Proxy Auth or a SGLang API key secret")
@@ -162,9 +163,11 @@ MODEL_STORE_PATH = "/models"
 
 COMPILE_CACHE_PATH = "/compile-cache"
 PI_LORA_STORE = "/pi-lora-store"
-PI_LORA_PATH = (
+PI_LORA_VOLUME_NAME = os.environ.get("QWEN38_PI_LORA_VOLUME", "modal-vllm-sglang")
+PI_LORA_PATH = os.environ.get(
+    "QWEN38_PI_LORA_PATH",
     PI_LORA_STORE + "/models/qwen38-pi/hub/models--harness-hub--Qwen3.8-27B-pi-adapted"
-    "/snapshots/7d42b119e2d4d475fa11270634b1ef98d1cd5aee"
+    "/snapshots/7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
 )
 PI_LORA_NAME = "qwen3.8-27B-pi"
 

@@ -45,8 +45,14 @@ def _model_path(root: Path, entry: dict, expected_repo: str, expected_revision: 
         for index in indices:
             data = json.loads(index.read_text(encoding="utf-8"))
             shards.update(data.get("weight_map", {}).values())
-        if not shards or any(not (path / shard).is_file() for shard in shards):
+        if not shards:
             raise RuntimeError(f"Missing indexed model shards: {path}")
+        for shard in shards:
+            if not isinstance(shard, str) or not shard:
+                raise RuntimeError(f"Invalid indexed model shard: {shard!r}")
+            target = (path / shard).resolve()
+            if not target.is_relative_to(path) or not target.is_file():
+                raise RuntimeError(f"Missing or unsafe indexed model shard: {shard}")
     elif not any(path.glob("*.safetensors")):
         raise RuntimeError(f"No model weight files: {path}")
     return path

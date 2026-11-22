@@ -31,9 +31,9 @@ HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
 ```
 
-The downloader uses modal-benchmark 0.1.5 on CPU. Its Reader validates
-persisted files, and an independent publish step writes the effective model
-paths to the Volume only after verification. GPU startup never downloads.
+The downloader uses modal-benchmark 0.2.1 on CPU. The single Coordinator
+verifies persisted files after Writers finish, then commits the effective
+model paths together with the completion receipt. GPU startup never downloads.
 When speculative decoding is disabled, the DFlash2 draft is not downloaded.
 
 ## SGLang runtime choice
@@ -262,11 +262,17 @@ To serve Pi LoRA, set `QWEN38_PI_LORA=1`. The cookbook image requires
 `QWEN38_SPECULATIVE_ALGORITHM=DFLASH` and
 `QWEN38_SGLANG_IMAGE=lmsysorg/sglang:nightly-dev-cu13-20260823-eec794bc`.
 This image uses its native DFlash2 worker and skips the cookbook overlay.
-The adapter is mounted read-only. Select `qwen3.8-27b:qwen3.8-27B-pi`
-in API requests. On RTX PRO 6000 with builder 2026.10 this combination passed
+The adapter is mounted read-only. Before allocating GPU, the CPU preflight
+also mounts the existing `modal-vllm-sglang` Volume and requires a valid
+`adapter_config.json` plus adapter weights. It will fail early if that Volume
+or snapshot is missing. Prepare the adapter in the same Modal workspace
+before enabling Pi LoRA; the model downloader only handles Target/DFlash2.
+Optional QWEN38_PI_LORA_VOLUME and QWEN38_PI_LORA_PATH override the
+adapter Volume and snapshot path when deploying in a different workspace.
+Select `qwen3.8-27b:qwen3.8-27B-pi` in API requests. On RTX PRO 6000 with builder 2026.10 this combination passed
 chat, SSE, a 130,029-token prompt and a Pi CLI file-read tool round trip.
 
-## 使用 modal-benchmark 0.2.0 下载权重
+## 使用 modal-benchmark 0.2.1 下载权重
 
 新流程完全独立于 GPU：一个 Coordinator、两个直接 Writer，不再有额外的 Discover/Inspect/Reader/Report/Publish 容器或远程队列。Writer 使用 Xet 下载和分批 Commit；Coordinator 刷新并检查 Volume，完成后一次性发布 `/models/.modal-model-manifest.json`。GPU 只读取清单，不复制权重。
 
@@ -281,4 +287,4 @@ uv run python -m deploy.download_models --execute --workers 2
 uv run modal deploy deploy/modal_app.py
 ```
 
-默认 Volume：`qwen38-27b-model-store`。下载器需要 Modal 认证和包含 `HF_TOKEN` 的 `huggingface-secret` Secret；它会产生 CPU、网络和存储费用。现有 Volume 的旧权重不会被删除，但没有 v2 发布清单的旧缓存不能直接启动 GPU。Pi LoRA 仍挂载旧 `modal-vllm-sglang` Volume，本次暂未改变适配器下载路径。`modal-benchmark` 依赖固定于 v0.2.0 Git commit `60c3e31f5812c98c2cd51618bdfcaed061616bdf`。
+默认 Volume：`qwen38-27b-model-store`。下载器需要 Modal 认证和包含 `HF_TOKEN` 的 `huggingface-secret` Secret；它会产生 CPU、网络和存储费用。现有 Volume 的旧权重不会被删除，但没有 v2 发布清单的旧缓存不能直接启动 GPU。Pi LoRA 默认使用 `modal-vllm-sglang` Volume，可通过 `QWEN38_PI_LORA_VOLUME` 和 `QWEN38_PI_LORA_PATH` 调整；CPU 预检会提前检查适配器内容。`modal-benchmark` 依赖固定于 v0.2.1 Git commit `3069ef6466baef314611acd0ca6244d3755d4c00`。

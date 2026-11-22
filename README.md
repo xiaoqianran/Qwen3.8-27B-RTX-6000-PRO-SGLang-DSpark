@@ -77,7 +77,7 @@ Runtime artifacts: `.sglang.log` (server log), `.sglang.pid` (container ID), `.c
 
 ## Modal deployment
 
-Deploy one Modal App, `qwen38-27b-modal`. Cherry Studio or any OpenAI-compatible client calls the `Qwen38HTTP` Server directly. One CPU Coordinator and two Writers prepare the model Volume; GPU startup does not download.
+Deploy one Modal App, `qwen38-27b-modal`. Cherry Studio or any OpenAI-compatible client calls the `Qwen38HTTP` Server directly. One CPU Coordinator and two Writers prepare the model Volume; GPU startup does not download. When Pi LoRA is enabled, the CPU readiness check also validates its separate read-only adapter Volume before starting the GPU.
 
 ```text
 OpenAI-compatible client → Qwen38HTTP (RTX PRO 6000) → SGLang + DFlash2
