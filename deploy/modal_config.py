@@ -162,13 +162,10 @@ CONFIG = ServingConfig()
 MODEL_STORE_PATH = "/models"
 
 COMPILE_CACHE_PATH = "/compile-cache"
-PI_LORA_STORE = "/pi-lora-store"
-PI_LORA_VOLUME_NAME = os.environ.get("QWEN38_PI_LORA_VOLUME", "modal-vllm-sglang")
-PI_LORA_PATH = os.environ.get(
-    "QWEN38_PI_LORA_PATH",
-    PI_LORA_STORE + "/models/qwen38-pi/hub/models--harness-hub--Qwen3.8-27B-pi-adapted"
-    "/snapshots/7d42b119e2d4d475fa11270634b1ef98d1cd5aee",
-)
+# Target, Draft and Pi adapter share the same read-only model Volume.
+PI_LORA_PATH = MODEL_STORE_PATH + "/adapters/pi-lora"
+PI_LORA_REPO_ID = "harness-hub/Qwen3.8-27B-pi-adapted"
+PI_LORA_REVISION = "7d42b119e2d4d475fa11270634b1ef98d1cd5aee"
 PI_LORA_NAME = "qwen3.8-27B-pi"
 
 
@@ -196,7 +193,8 @@ def runtime_cache_identity() -> dict[str, object]:
         "mamba_radix_cache_strategy": c.mamba_radix_cache_strategy,
         "mamba_ssm_dtype": c.mamba_ssm_dtype,
         "speculative_algorithm": c.speculative_algorithm,
-        **({"pi_lora": PI_LORA_PATH} if c.pi_lora else {}),
+        **({"pi_lora": {"path": PI_LORA_PATH, "revision": PI_LORA_REVISION}}
+           if c.pi_lora else {}),
         "speculative_num_draft_tokens": c.speculative_num_draft_tokens,
         "speculative_draft_quantization": c.speculative_draft_quantization,
         "speculative_draft_attention_backend": c.speculative_draft_attention_backend,

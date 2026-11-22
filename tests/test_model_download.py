@@ -11,6 +11,10 @@ import unittest
 from deploy.download_models import MANIFEST, main, sources, validate_model_store
 from deploy.modal_config import CONFIG, UPSTREAM_LORA_IMAGE, build_sglang_command
 from deploy import modal_app
+from deploy.pi_lora import (
+    ADAPTER_FILES, ADAPTER_MANIFEST, PI_LORA_REVISION,
+    _prepare_adapter, validate_pi_lora,
+)
 
 
 class ModelDownloadTests(unittest.TestCase):
@@ -87,18 +91,98 @@ class ModelDownloadTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "unsafe indexed model shard"):
             self.read()
 
-    def test_pi_lora_preflight_missing_config_and_weights(self):
+    def _adapter_fixture(self, folder):
+        import hashlib
+        data = {"adapter_config.json": b"{}",
+                "adapter_model.safetensors": b"test-weights"}
+        folder.mkdir(parents=True, exist_ok=True)
+        for name, content in data.items():
+            (folder / name).write_bytes(content)
+        record = {
+            "version": 1, "repo_id": "harness-hub/Qwen3.8-27B-pi-adapted",
+            "revision": PI_LORA_REVISION,
+            "files": {name: {"size": len(content),
+                             "sha256": hashlib.sha256(content).hexdigest()}
+                      for name, content in data.items()},
+        }
+        (folder / ADAPTER_MANIFEST).write_text(json.dumps(record), encoding="utf-8")
+        return record
+
+    def test_pi_lora_preflight_requires_complete_pinned_snapshot(self):
         with TemporaryDirectory() as temp:
-            folder = Path(temp)
+            folder = Path(temp) / "pi-lora"
             with (patch.object(modal_app, "PI_LORA_PATH", str(folder)),
-                  patch.object(modal_app, "CONFIG", replace(CONFIG, pi_lora=True, sglang_image=UPSTREAM_LORA_IMAGE))):
-                with self.assertRaisesRegex(RuntimeError, "adapter_config.json"):
+                  patch.object(modal_app, "CONFIG",
+                               replace(CONFIG, pi_lora=True,
+                                       sglang_image=UPSTREAM_LORA_IMAGE))):
+                with self.assertRaisesRegex(RuntimeError, "manifest missing"):
                     modal_app._validate_pi_lora()
-                (folder / "adapter_config.json").write_text("{}", encoding="utf-8")
-                with self.assertRaisesRegex(RuntimeError, "weights"):
+                record = self._adapter_fixture(folder)
+                modal_app._validate_pi_lora(verify_checksum=True)
+                record["revision"] = "b" * 40
+                (folder / ADAPTER_MANIFEST).write_text(json.dumps(record))
+                with self.assertRaisesRegex(RuntimeError, "revision mismatch"):
                     modal_app._validate_pi_lora()
-                (folder / "adapter_model.safetensors").write_bytes(b"mock")
-                modal_app._validate_pi_lora()
+
+    def test_pi_lora_rejects_corrupt_weights_even_if_size_unchanged(self):
+        with TemporaryDirectory() as temp:
+            folder = Path(temp) / "pi-lora"
+            self._adapter_fixture(folder)
+            (folder / "adapter_model.safetensors").write_bytes(b"evil-weights")
+            with self.assertRaisesRegex(RuntimeError, "SHA256 mismatch"):
+                validate_pi_lora(str(folder), verify_checksum=True)
+
+    def test_adapter_preparation_publishes_once_and_reuses(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            upstream = root / "source"
+            files = self._adapter_fixture(upstream)
+            info = files["files"]
+            volume = Mock()
+            target = root / "volume"
+            first = _prepare_adapter(
+                download_file=lambda name: upstream / name,
+                file_info=info, volume=volume, mount=str(target),
+            )
+            self.assertEqual(first["status"], "PUBLISHED")
+            volume.commit.assert_called_once()
+            self.assertEqual(
+                validate_pi_lora(str(target / "adapters" / "pi-lora"),
+                                 verify_checksum=True), first["manifest"])
+            second = _prepare_adapter(
+                download_file=lambda _: self.fail("should reuse existing adapter"),
+                file_info=info, volume=volume, mount=str(target),
+            )
+            self.assertEqual(second["status"], "REUSED")
+            volume.commit.assert_called_once()
+
+    def test_adapter_preparation_commit_failure_cleans_incomplete_publish(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            upstream = root / "source"
+            info = self._adapter_fixture(upstream)["files"]
+            volume = Mock()
+            volume.commit.side_effect = RuntimeError("commit unavailable")
+            with self.assertRaisesRegex(RuntimeError, "commit unavailable"):
+                _prepare_adapter(
+                    download_file=lambda name: upstream / name,
+                    file_info=info, volume=volume, mount=str(root / "volume"),
+                )
+            self.assertFalse((root / "volume" / "adapters" / "pi-lora").exists())
+
+    def test_adapter_preparation_rejects_bad_source_digest(self):
+        with TemporaryDirectory() as temp:
+            root = Path(temp)
+            upstream = root / "source"
+            info = self._adapter_fixture(upstream)["files"]
+            info["adapter_model.safetensors"]["sha256"] = "0" * 64
+            volume = Mock()
+            with self.assertRaisesRegex(RuntimeError, "integrity mismatch"):
+                _prepare_adapter(
+                    download_file=lambda name: upstream / name,
+                    file_info=info, volume=volume, mount=str(root / "volume"),
+                )
+            volume.commit.assert_not_called()
 
     def test_pi_lora_disabled_skips_adapters(self):
         with patch.object(modal_app, "CONFIG", replace(CONFIG, pi_lora=False)):
