@@ -31,7 +31,7 @@ HF_HUB_OFFLINE=1
 TRANSFORMERS_OFFLINE=1
 ```
 
-The downloader uses modal-benchmark 0.2.1 on CPU. The single Coordinator
+The downloader uses modal-benchmark 0.2.2 on CPU. The single Coordinator
 verifies persisted files after Writers finish, then commits the effective
 model paths together with the completion receipt. GPU startup never downloads.
 When speculative decoding is disabled, the DFlash2 draft is not downloaded.
@@ -296,5 +296,4 @@ Target/Draft 继续使用原有固定 Revision 目录，路径由
 `/models/adapters/pi-lora/`，包含适配器配置、权重与
 `.adapter-manifest.json`。无需迁移或复制现有 27 GB 权重。
 编译缓存仍单独放在 `qwen38-27b-compile-cache`（不是模型）。
-`modal-benchmark` 固定使用 v0.2.1 Git 提交
-`3069ef6466baef314611acd0ca6244d3755d4c00`。
+`modal-benchmark` 现固定使用 PyPI `modal-benchmark==0.2.2`；默认 Xet 不再因 Volume 文件时间戳变化触发完整文件 SHA-256。

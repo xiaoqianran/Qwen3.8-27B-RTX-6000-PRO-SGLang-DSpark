@@ -460,10 +460,14 @@ api-proxy-support = [
 
 [[package]]
 name = "modal-benchmark"
-version = "0.2.1"
-source = { git = "https://github.com/xiaoqianran/modal-benchmark.git?rev=3069ef6466baef314611acd0ca6244d3755d4c00#3069ef6466baef314611acd0ca6244d3755d4c00" }
+version = "0.2.2"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "modal", extra = ["api-proxy-support"] },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/87/db/07b7c75f5c0b11aa66356aa5139851a57e4ce9f17e202500ce9aa2a3be40/modal_benchmark-0.2.2.tar.gz", hash = "sha256:850b0083197b7bc277cff76ced0c8827fd6d6fd16a049a7cd1e8784a183791c6", size = 41627, upload-time = "2026-11-22T05:29:33.668Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d4/39/c5f39e930175bcd0e16ad9ca752d3aabc24533258399765e834db4e59add/modal_benchmark-0.2.2-py3-none-any.whl", hash = "sha256:ecf2dc0c44d1f4915cdc13124830f8b8deb7c9b4d8a3ddeb98ef584f10e1c2cd", size = 19292, upload-time = "2026-11-22T05:29:32.35Z" },
 ]
 
 [[package]]
@@ -720,7 +724,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "modal", extras = ["api-proxy-support"], specifier = "==1.6.4" },
-    { name = "modal-benchmark", git = "https://github.com/xiaoqianran/modal-benchmark.git?rev=3069ef6466baef314611acd0ca6244d3755d4c00" },
+    { name = "modal-benchmark", specifier = "==0.2.2", index = "https://pypi.org/simple" },
 ]
 
 [[package]]

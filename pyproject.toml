@@ -5,5 +5,16 @@ description = "Modal deployment tooling for Qwen3.8-27B on SGLang"
 requires-python = ">=3.11,<3.15"
 dependencies = [
     "modal[api-proxy-support]==1.6.4",
-    "modal-benchmark @ git+https://github.com/xiaoqianran/modal-benchmark.git@3069ef6466baef314611acd0ca6244d3755d4c00",
+    "modal-benchmark==0.2.2",
 ]
+
+
+# Public PyPI only for this newly released package; keep the configured
+# default mirror for existing pinned dependencies.
+[tool.uv.sources]
+modal-benchmark = { index = "pypi" }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
